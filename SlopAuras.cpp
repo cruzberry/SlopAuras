@@ -194,6 +194,7 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
 {
     ToolboxUIPlugin::Initialize(ctx, allocator_fns, toolbox_dll);
     GW::UI::RegisterUIMessageCallback(&map_loading_hook, GW::UI::UIMessage::kLoadMapContext, [this](GW::HookStatus*, GW::UI::UIMessage, void*, void*) {
+        map_generation.fetch_add(1, std::memory_order_acq_rel);
         std::lock_guard lock(tracking_mutex);
         tracked_casts.clear();
         tracked_cooldowns.clear();
@@ -201,10 +202,11 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
     });
     GW::UI::RegisterUIMessageCallback(&skill_started_cast_hook, GW::UI::UIMessage::kAgentSkillStartedCast, [this](GW::HookStatus*, GW::UI::UIMessage, void* wparam, void*) {
         const auto* packet = static_cast<GW::UI::UIPacket::kAgentSkillStartedCast*>(wparam);
-        if (!packet || !IsGameWorldReady()
+        if (!packet || !IsMapReady()
             || packet->agent_id != GW::Agents::GetControlledCharacterId()) {
             return;
         }
+        const auto generation = map_generation.load(std::memory_order_acquire);
         const auto skill_id = static_cast<uint32_t>(packet->skill_id);
         if (skill_id >= GW::SkillbarMgr::GetSkillCount()) {
             return;
@@ -215,6 +217,9 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
         }
         const auto now = GW::MemoryMgr::GetSkillTimer();
         std::lock_guard lock(tracking_mutex);
+        if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+            return;
+        }
         const auto is_cast_by_me = std::ranges::any_of(cast_by_me_entries, [this, skill_id](const int entry) {
             return entry >= 0 && static_cast<size_t>(entry) < effect_ids.size()
                 && effect_ids[entry] == static_cast<int>(skill_id);
@@ -229,8 +234,12 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
     });
     GW::UI::RegisterUIMessageCallback(&skill_activated_hook, GW::UI::UIMessage::kAgentSkillActivated, [this](GW::HookStatus*, GW::UI::UIMessage, void* wparam, void*) {
         const auto* packet = static_cast<GW::UI::UIPacket::kAgentSkillPacket*>(wparam);
-        if (packet && IsGameWorldReady()) {
+        if (packet && IsMapReady()) {
+            const auto generation = map_generation.load(std::memory_order_acquire);
             TrackEnemyCooldown(packet->agent_id, static_cast<uint32_t>(packet->skill_id));
+            if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+                return;
+            }
             if (packet->agent_id != GW::Agents::GetControlledCharacterId()) {
                 return;
             }
@@ -243,7 +252,8 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
                     return cast.skill_id == skill_id;
                 });
                 if (pending != pending_casts.rend()) {
-                    if (now - pending->timestamp <= 10000) {
+                    if (generation == map_generation.load(std::memory_order_acquire)
+                        && now - pending->timestamp <= 10000) {
                         target_agent_id = pending->target_agent_id;
                     }
                     pending_casts.erase(std::next(pending).base());
@@ -254,8 +264,12 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
     });
     GW::UI::RegisterUIMessageCallback(&skill_activated_hook, GW::UI::UIMessage::kAgentSkillActivatedInstantly, [this](GW::HookStatus*, GW::UI::UIMessage, void* wparam, void*) {
         const auto* packet = static_cast<GW::UI::UIPacket::kAgentSkillPacket*>(wparam);
-        if (packet && IsGameWorldReady()) {
+        if (packet && IsMapReady()) {
+            const auto generation = map_generation.load(std::memory_order_acquire);
             TrackEnemyCooldown(packet->agent_id, static_cast<uint32_t>(packet->skill_id));
+            if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+                return;
+            }
             if (packet->agent_id != GW::Agents::GetControlledCharacterId()) {
                 return;
             }
@@ -278,16 +292,32 @@ void SlopAuras::Terminate()
     ToolboxUIPlugin::Terminate();
 }
 
+bool SlopAuras::IsMapReady() const
+{
+    const auto generation = map_generation.load(std::memory_order_acquire);
+    return generation == ready_map_generation.load(std::memory_order_acquire)
+        && IsGameWorldReady()
+        && generation == map_generation.load(std::memory_order_acquire);
+}
+
 void SlopAuras::Update(float delta)
 {
     ToolboxUIPlugin::Update(delta);
-    if (!IsGameWorldReady()) {
+    const auto generation = map_generation.load(std::memory_order_acquire);
+    if (!IsGameWorldReady() || generation != map_generation.load(std::memory_order_acquire)) {
+        return;
+    }
+    ready_map_generation.store(generation, std::memory_order_release);
+    if (!IsMapReady()) {
         return;
     }
     const auto now = GW::MemoryMgr::GetSkillTimer();
     std::lock_guard lock(tracking_mutex);
-    std::erase_if(tracked_cooldowns, [now](const TrackedCooldown& cooldown) {
+    std::erase_if(tracked_cooldowns, [this, generation, now](const TrackedCooldown& cooldown) {
         if (now - cooldown.timestamp >= cooldown.duration_ms) {
+            return true;
+        }
+        if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
             return true;
         }
         const auto* agent = GW::Agents::GetAgentByID(cooldown.agent_id);
@@ -298,7 +328,8 @@ void SlopAuras::Update(float delta)
 
 void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
 {
-    if (!IsGameWorldReady()
+    const auto generation = map_generation.load(std::memory_order_acquire);
+    if (!IsMapReady()
         || skill_id <= 0 || static_cast<uint32_t>(skill_id) >= GW::SkillbarMgr::GetSkillCount()) {
         return;
     }
@@ -341,6 +372,9 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
         ? GW::Agents::GetControlledCharacterId()
         : target_id;
     std::lock_guard lock(tracking_mutex);
+    if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+        return;
+    }
     if (std::ranges::find(effect_ids, skill_id) == effect_ids.end()) {
         return;
     }
@@ -383,7 +417,8 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
 
 void SlopAuras::TrackEnemyCooldown(const uint32_t agent_id, const uint32_t skill_id)
 {
-    if (!IsGameWorldReady() || !skill_id || skill_id >= GW::SkillbarMgr::GetSkillCount()) {
+    const auto generation = map_generation.load(std::memory_order_acquire);
+    if (!IsMapReady() || !skill_id || skill_id >= GW::SkillbarMgr::GetSkillCount()) {
         return;
     }
     const auto* agent = GW::Agents::GetAgentByID(agent_id);
@@ -397,13 +432,19 @@ void SlopAuras::TrackEnemyCooldown(const uint32_t agent_id, const uint32_t skill
     const auto now = GW::MemoryMgr::GetSkillTimer();
     const auto duration_ms = skill->recharge * 1000u;
     std::lock_guard lock(tracking_mutex);
+    if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+        return;
+    }
     if (std::ranges::find(cooldown_ids, static_cast<int>(skill_id)) == cooldown_ids.end()) {
         return;
     }
     std::erase_if(tracked_cooldowns, [now](const TrackedCooldown& cooldown) {
         return now - cooldown.timestamp >= cooldown.duration_ms;
     });
-    std::erase_if(tracked_cooldowns, [](const TrackedCooldown& cooldown) {
+    std::erase_if(tracked_cooldowns, [this, generation](const TrackedCooldown& cooldown) {
+        if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+            return true;
+        }
         const auto* agent = GW::Agents::GetAgentByID(cooldown.agent_id);
         const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
         return !living || !living->GetIsAlive() || living->allegiance != GW::Constants::Allegiance::Enemy;
@@ -422,7 +463,11 @@ void SlopAuras::TrackEnemyCooldown(const uint32_t agent_id, const uint32_t skill
 
 void SlopAuras::Draw(IDirect3DDevice9*)
 {
-    if (!GetVisiblePtr() || !*GetVisiblePtr() || !IsGameWorldReady()) {
+    const auto generation = map_generation.load(std::memory_order_acquire);
+    const auto map_is_current = [this, generation] {
+        return generation == map_generation.load(std::memory_order_acquire) && IsMapReady();
+    };
+    if (!GetVisiblePtr() || !*GetVisiblePtr() || !map_is_current()) {
         return;
     }
 
@@ -434,6 +479,13 @@ void SlopAuras::Draw(IDirect3DDevice9*)
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.f, 0.f, 0.f, 0.f));
     }
     if (ImGui::Begin(Name(), GetVisiblePtr(), GetWinFlags(widget_flags))) {
+        if (!map_is_current()) {
+            ImGui::End();
+            if (widget_mode) {
+                ImGui::PopStyleColor();
+            }
+            return;
+        }
         const auto effects = GW::Effects::GetPlayerEffects();
         const auto now = GW::MemoryMgr::GetSkillTimer();
         std::vector<int> tracked_skill_ids;
@@ -443,12 +495,15 @@ void SlopAuras::Draw(IDirect3DDevice9*)
         std::vector<TrackedCooldown> tracked_cooldowns_snapshot;
         {
             std::lock_guard lock(tracking_mutex);
-            std::erase_if(tracked_casts, [now](const TrackedCast& cast) {
+            std::erase_if(tracked_casts, [this, generation, now](const TrackedCast& cast) {
                 if (now - cast.timestamp >= cast.duration_ms) {
                     return true;
                 }
                 if (now - cast.timestamp < 1500) {
                     return false;
+                }
+                if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+                    return true;
                 }
                 const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast.skill_id));
                 return skill && skill->type != GW::Constants::SkillType::Ritual
@@ -459,6 +514,14 @@ void SlopAuras::Draw(IDirect3DDevice9*)
             cooldown_ids_snapshot = cooldown_ids;
             tracked_casts_snapshot = tracked_casts;
             tracked_cooldowns_snapshot = tracked_cooldowns;
+        }
+
+        if (!map_is_current()) {
+            ImGui::End();
+            if (widget_mode) {
+                ImGui::PopStyleColor();
+            }
+            return;
         }
 
         struct ActiveEffect {
@@ -480,7 +543,7 @@ void SlopAuras::Draw(IDirect3DDevice9*)
         };
         bool has_active_effect = false;
 
-        for (size_t entry_index = 0; entry_index < tracked_skill_ids.size(); ++entry_index) {
+        for (size_t entry_index = 0; entry_index < tracked_skill_ids.size() && map_is_current(); ++entry_index) {
             const auto skill_id = tracked_skill_ids[entry_index];
             if (skill_id <= 0) {
                 continue;
@@ -490,16 +553,22 @@ void SlopAuras::Draw(IDirect3DDevice9*)
             if (effects && !cast_by_me) {
                 DWORD remaining = 0;
                 for (const auto& effect : *effects) {
+                    if (!map_is_current()) {
+                        break;
+                    }
                     if (static_cast<int>(effect.skill_id) == skill_id) {
                         remaining = std::max(remaining, effect.GetTimeRemaining());
                     }
                 }
-                if (remaining > 0) {
+                if (remaining > 0 && map_is_current()) {
                     add_active_effect(skill_id, GW::Agents::GetControlledCharacterId(), remaining);
                 }
             }
 
             for (const auto& cast : tracked_casts_snapshot) {
+                if (!map_is_current()) {
+                    break;
+                }
                 if (static_cast<int>(cast.skill_id) == skill_id) {
                     const auto remaining = cast.duration_ms - (now - cast.timestamp);
                     if (remaining > 0) {
@@ -513,6 +582,9 @@ void SlopAuras::Draw(IDirect3DDevice9*)
             return lhs.remaining < rhs.remaining;
         });
         for (const auto& effect : active_effects) {
+            if (!map_is_current()) {
+                break;
+            }
             const auto target_name = effect.target_agent_id == GW::Agents::GetControlledCharacterId()
                 ? "you"
                 : GetAgentName(effect.target_agent_id);
@@ -548,6 +620,9 @@ void SlopAuras::Draw(IDirect3DDevice9*)
             ImGui::TextUnformatted("Enemy skill cooldowns");
         }
         for (const auto& cooldown : active_cooldowns) {
+            if (!map_is_current()) {
+                break;
+            }
             const auto target_name = GetAgentName(cooldown.agent_id);
             const auto icon = GetSkillImage(static_cast<GW::Constants::SkillID>(cooldown.skill_id));
             if (icon && *icon) {
@@ -558,7 +633,7 @@ void SlopAuras::Draw(IDirect3DDevice9*)
             has_active_effect = true;
         }
 
-        if (!has_active_effect) {
+        if (!has_active_effect && map_is_current()) {
             ImGui::TextUnformatted("No tracked effects active");
         }
     }
@@ -588,7 +663,7 @@ void SlopAuras::DrawSettings()
     for (size_t entry_index = 0; entry_index < effect_ids.size(); ++entry_index) {
         auto it = effect_ids.begin() + entry_index;
         ImGui::PushID(input_id++);
-        const auto name = IsGameWorldReady() ? GetSkillName(*it) : std::string("Unknown skill");
+        const auto name = IsMapReady() ? GetSkillName(*it) : std::string("Unknown skill");
         ImGui::TextUnformatted(name.c_str());
         ImGui::SameLine();
         ImGui::SetNextItemWidth(100.f);
@@ -596,7 +671,7 @@ void SlopAuras::DrawSettings()
         const int previous_id = *it;
         *it = std::max(0, *it);
         settings_changed |= *it != previous_id;
-        const auto* skill = IsGameWorldReady()
+        const auto* skill = IsMapReady()
             && *it > 0 && static_cast<uint32_t>(*it) < GW::SkillbarMgr::GetSkillCount()
             ? GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(*it))
             : nullptr;
@@ -641,7 +716,7 @@ void SlopAuras::DrawSettings()
     ImGui::TextUnformatted("Track enemy skill cooldowns by skill ID:");
     for (auto it = cooldown_ids.begin(); it != cooldown_ids.end(); ++it) {
         ImGui::PushID(input_id++);
-        const auto name = IsGameWorldReady() ? GetSkillName(*it) : std::string("Unknown skill");
+        const auto name = IsMapReady() ? GetSkillName(*it) : std::string("Unknown skill");
         ImGui::TextUnformatted(name.c_str());
         ImGui::SameLine();
         ImGui::SetNextItemWidth(100.f);
