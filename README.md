@@ -2,9 +2,9 @@
 
 SlopAuras is a GWToolbox++ plugin that displays remaining durations for selected player effects.
 
-To configure tracked effects, open the SlopAuras section under Toolbox's **Settings > Plugins** and select **Open SlopAuras settings**. The settings window is drawn while the main SlopAuras window is visible and the game map is ready. The SlopAuras window lists matching effects while they are active. Natural Resistance agents are configured by name, so the setting remains valid if an agent's model ID changes. Existing Natural Resistance model-ID entries must be added again by name.
+To configure tracked effects, open the SlopAuras section under Toolbox's **Settings > Plugins** and select **Open SlopAuras settings**. The settings window is drawn while the main SlopAuras window is visible. The SlopAuras window lists matching effects while they are active. Natural Resistance agents are configured by name, so the setting remains valid if an agent's model ID changes.
 
-SlopAuras provides client-side chat commands: `/sa hide` hides its window, `/sa show` shows it, and `/sa help` lists the commands in chat. These commands are intercepted locally and are not sent to the game server.
+SlopAuras provides client-side chat commands: `/sa hide` hides its window, `/sa show` shows it, and `/sa help` lists the commands in chat.
 
 ## Building
 
