@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <ToolboxUIPlugin.h>
 #include <GWCA/Managers/UIMgr.h>
 
@@ -39,10 +40,13 @@ private:
 
     void TrackCast(int skill_id, uint32_t target_agent_id);
     void TrackEnemyCooldown(uint32_t agent_id, uint32_t skill_id);
+    bool IsMapReady() const;
 
     GW::HookEntry skill_activated_hook;
     GW::HookEntry skill_started_cast_hook;
     GW::HookEntry map_loading_hook;
+    std::atomic<uint32_t> map_generation = 0;
+    std::atomic<uint32_t> ready_map_generation = 0;
     std::mutex tracking_mutex;
     std::vector<int> effect_ids;
     std::vector<int> cast_by_me_entries;
