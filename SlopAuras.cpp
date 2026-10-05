@@ -190,9 +190,41 @@ DLLAPI ToolboxPlugin* ToolboxPluginInstance()
     return &instance;
 }
 
+void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const int argc, const LPWSTR* argv)
+{
+    if (!status) {
+        return;
+    }
+    status->blocked = true;
+
+    const auto print_help = [] {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa hide - Hide the SlopAuras window.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa show - Show the SlopAuras window.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa help - List SlopAuras chat commands.", L"SlopAuras");
+    };
+
+    if (argc != 2 || !argv || !argv[1]) {
+        print_help();
+        return;
+    }
+
+    const auto subcommand = PluginUtils::ToLower(argv[1]);
+    auto* instance = static_cast<SlopAuras*>(ToolboxPluginInstance());
+    if (subcommand == L"hide") {
+        *instance->GetVisiblePtr() = false;
+    }
+    else if (subcommand == L"show") {
+        *instance->GetVisiblePtr() = true;
+    }
+    else {
+        print_help();
+    }
+}
+
 void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODULE toolbox_dll)
 {
     ToolboxUIPlugin::Initialize(ctx, allocator_fns, toolbox_dll);
+    GW::Chat::CreateCommand(&chat_command_hook, L"sa", HandleChatCommand);
     GW::UI::RegisterUIMessageCallback(&map_loading_hook, GW::UI::UIMessage::kLoadMapContext, [this](GW::HookStatus*, GW::UI::UIMessage, void*, void*) {
         map_generation.fetch_add(1, std::memory_order_acq_rel);
         std::lock_guard lock(tracking_mutex);
@@ -276,6 +308,12 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
             TrackCast(static_cast<int>(packet->skill_id), GW::Agents::GetTargetId());
         }
     });
+}
+
+void SlopAuras::SignalTerminate()
+{
+    ToolboxUIPlugin::SignalTerminate();
+    GW::Chat::DeleteCommand(&chat_command_hook, L"sa");
 }
 
 void SlopAuras::Terminate()

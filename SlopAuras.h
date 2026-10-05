@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <ToolboxUIPlugin.h>
+#include <GWCA/Managers/ChatMgr.h>
 #include <GWCA/Managers/UIMgr.h>
 
 class SlopAuras : public ToolboxUIPlugin {
@@ -9,6 +10,7 @@ public:
     const char* Name() const override { return "SlopAuras"; }
 
     void Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODULE toolbox_dll) override;
+    void SignalTerminate() override;
     void Terminate() override;
     void Update(float delta) override;
     void Draw(IDirect3DDevice9* pDevice) override;
@@ -41,8 +43,10 @@ private:
     void TrackCast(int skill_id, uint32_t target_agent_id);
     void TrackEnemyCooldown(uint32_t agent_id, uint32_t skill_id);
     bool IsMapReady() const;
+    static void HandleChatCommand(GW::HookStatus* status, const wchar_t* command, int argc, const LPWSTR* argv);
     void DrawSettingsWindow();
 
+    GW::HookEntry chat_command_hook;
     GW::HookEntry skill_activated_hook;
     GW::HookEntry skill_started_cast_hook;
     GW::HookEntry map_loading_hook;
