@@ -41,6 +41,7 @@ private:
     void TrackCast(int skill_id, uint32_t target_agent_id);
     void TrackEnemyCooldown(uint32_t agent_id, uint32_t skill_id);
     bool IsMapReady() const;
+    void DrawSettingsWindow();
 
     GW::HookEntry skill_activated_hook;
     GW::HookEntry skill_started_cast_hook;
@@ -55,6 +56,7 @@ private:
     std::vector<TrackedCast> tracked_casts;
     std::vector<TrackedCooldown> tracked_cooldowns;
     std::vector<PendingCast> pending_casts;
+    bool settings_window_visible = false;
     bool widget_mode = false;
     float effect_icon_size = 22.f;
     float cooldown_icon_size = 22.f;
