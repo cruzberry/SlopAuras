@@ -679,11 +679,25 @@ void SlopAuras::Draw(IDirect3DDevice9*)
     if (widget_mode) {
         ImGui::PopStyleColor();
     }
+    if (settings_window_visible && map_is_current()) {
+        DrawSettingsWindow();
+    }
 }
 
 void SlopAuras::DrawSettings()
 {
     ToolboxUIPlugin::DrawSettings();
+    if (ImGui::Button("Open SlopAuras settings")) {
+        settings_window_visible = true;
+    }
+}
+
+void SlopAuras::DrawSettingsWindow()
+{
+    if (!ImGui::Begin("SlopAuras Settings", &settings_window_visible)) {
+        ImGui::End();
+        return;
+    }
 
     bool settings_changed = ImGui::Checkbox("Widget mode", &widget_mode);
     if (ImGui::IsItemHovered()) {
@@ -814,6 +828,7 @@ void SlopAuras::DrawSettings()
         lock.unlock();
         SaveSettings(nullptr);
     }
+    ImGui::End();
 }
 
 std::filesystem::path SlopAuras::GetSettingFile(const wchar_t*) const
