@@ -56,7 +56,7 @@ private:
     std::vector<int> effect_ids;
     std::vector<int> cast_by_me_entries;
     std::vector<int> cooldown_ids;
-    std::vector<int> natural_resistance_model_ids;
+    std::vector<std::string> natural_resistance_agent_names;
     std::vector<TrackedCast> tracked_casts;
     std::vector<TrackedCooldown> tracked_cooldowns;
     std::vector<PendingCast> pending_casts;
