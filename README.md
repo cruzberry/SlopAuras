@@ -2,7 +2,7 @@
 
 SlopAuras is a GWToolbox++ plugin that tracks selected player effects and enemy cooldowns.
 
-Configure tracked skills in **Settings > Plugins > SlopAuras > Open SlopAuras settings**. PvE durations scale with title rank when available. Condition timers are estimates because the game does not expose exact remaining time. Configure Natural Resistance agents by name.
+Configure tracked skills in **Settings > Plugins > SlopAuras > Open SlopAuras settings**. PvE durations scale with title rank when available. Party-wide shouts and area enchantments such as Dark Fury show one predicted timer, refined by observable party effects when available. GW may not expose effects on other human players. Condition timers are estimates because the game does not expose exact remaining time. Configure Natural Resistance agents by name.
 
 Commands: `/sa hide`, `/sa show`, `/sa print`, `/sa mute`, `/sa unmute`, and `/sa help`. Print omits effects on configured Natural Resistance agents.
 

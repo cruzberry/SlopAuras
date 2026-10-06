@@ -43,6 +43,9 @@ private:
         uint32_t timestamp;
         uint32_t duration_ms;
         bool expiration_notified = false;
+        bool multi_ally = false;
+        uint32_t observed_remaining_ms = 0;
+        uint32_t observed_updated_timestamp = 0;
     };
 
     struct TrackedCooldown {
