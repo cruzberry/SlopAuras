@@ -17,9 +17,11 @@
 #include <GWCA/Context/WorldContext.h>
 #include <GWCA/GameEntities/Agent.h>
 #include <GWCA/GameEntities/Attribute.h>
+#include <GWCA/GameEntities/Camera.h>
 #include <GWCA/GameEntities/Skill.h>
 #include <GWCA/GameEntities/Title.h>
 #include <GWCA/Managers/AgentMgr.h>
+#include <GWCA/Managers/CameraMgr.h>
 #include <GWCA/Managers/EffectMgr.h>
 #include <GWCA/Managers/GameThreadMgr.h>
 #include <GWCA/Managers/ItemMgr.h>
@@ -31,6 +33,7 @@
 #include <GWCA/Packets/StoC.h>
 #include <GWCA/Managers/UIMgr.h>
 
+#include <DirectXMath.h>
 #pragma comment(lib, "Comdlg32.lib")
 #pragma comment(lib, "Winmm.lib")
 
@@ -65,36 +68,30 @@ namespace {
         return living && living->allegiance == GW::Constants::Allegiance::Enemy;
     }
 
-    bool TransformPoint(const D3DMATRIX& matrix, float& x, float& y, float& z, float& w)
-    {
-        const auto tx = x * matrix._11 + y * matrix._21 + z * matrix._31 + w * matrix._41;
-        const auto ty = x * matrix._12 + y * matrix._22 + z * matrix._32 + w * matrix._42;
-        const auto tz = x * matrix._13 + y * matrix._23 + z * matrix._33 + w * matrix._43;
-        const auto tw = x * matrix._14 + y * matrix._24 + z * matrix._34 + w * matrix._44;
-        x = tx;
-        y = ty;
-        z = tz;
-        w = tw;
-        return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::isfinite(w);
-    }
-
     struct AgentProjection {
-        D3DMATRIX view{};
-        D3DMATRIX projection{};
-        D3DVIEWPORT9 viewport{};
+        DirectX::XMMATRIX view_projection;
+        uint32_t viewport_width;
+        uint32_t viewport_height;
     };
 
-    bool GetAgentProjection(IDirect3DDevice9* device, AgentProjection& projection)
+    bool GetAgentProjection(AgentProjection& projection)
     {
-        if (!device) {
+        const auto* camera = GW::CameraMgr::GetCamera();
+        const auto viewport_width = GW::Render::GetViewportWidth();
+        const auto viewport_height = GW::Render::GetViewportHeight();
+        const auto fov = GW::Render::GetFieldOfView();
+        if (!camera || !viewport_width || !viewport_height || !std::isfinite(fov) || fov <= 0.f) {
             return false;
         }
-        if (FAILED(device->GetTransform(D3DTS_VIEW, &projection.view))
-            || FAILED(device->GetTransform(D3DTS_PROJECTION, &projection.projection))
-            || FAILED(device->GetViewport(&projection.viewport))
-            || !projection.viewport.Width || !projection.viewport.Height) {
-            return false;
-        }
+        const auto eye = DirectX::XMVectorSet(camera->position.x, camera->position.y, camera->position.z, 1.f);
+        const auto target = DirectX::XMVectorSet(camera->look_at_target.x, camera->look_at_target.y, camera->look_at_target.z, 1.f);
+        const auto up = DirectX::XMVectorSet(0.f, 0.f, -1.f, 0.f);
+        const auto view = DirectX::XMMatrixLookAtLH(eye, target, up);
+        const auto projection_matrix = DirectX::XMMatrixPerspectiveFovLH(
+            fov, static_cast<float>(viewport_width) / static_cast<float>(viewport_height), 0.1f, 100000.f);
+        projection.view_projection = DirectX::XMMatrixMultiply(view, projection_matrix);
+        projection.viewport_width = viewport_width;
+        projection.viewport_height = viewport_height;
         return true;
     }
 
@@ -103,27 +100,24 @@ namespace {
         if (!agent) {
             return false;
         }
-        float x = agent->name_tag_x;
-        float y = agent->name_tag_y;
-        float z = agent->name_tag_z;
-        float w = 1.f;
-        if (!TransformPoint(projection.view, x, y, z, w)
-            || !TransformPoint(projection.projection, x, y, z, w)
-            || w <= 0.f) {
+        const auto world_position = DirectX::XMVectorSet(agent->name_tag_x, agent->name_tag_y, agent->name_tag_z, 1.f);
+        const auto clip_position = DirectX::XMVector4Transform(world_position, projection.view_projection);
+        DirectX::XMFLOAT4 clip;
+        DirectX::XMStoreFloat4(&clip, clip_position);
+        if (!std::isfinite(clip.x) || !std::isfinite(clip.y) || !std::isfinite(clip.z)
+            || !std::isfinite(clip.w) || clip.w <= 0.f) {
             return false;
         }
 
-        const auto depth = z / w;
-        const auto normalized_x = x / w;
-        const auto normalized_y = y / w;
+        const auto depth = clip.z / clip.w;
+        const auto normalized_x = clip.x / clip.w;
+        const auto normalized_y = clip.y / clip.w;
         if (depth < 0.f || depth > 1.f || normalized_x < -1.f || normalized_x > 1.f
             || normalized_y < -1.f || normalized_y > 1.f) {
             return false;
         }
-        screen_position.x = static_cast<float>(projection.viewport.X)
-            + (normalized_x + 1.f) * static_cast<float>(projection.viewport.Width) * 0.5f;
-        screen_position.y = static_cast<float>(projection.viewport.Y)
-            + (1.f - normalized_y) * static_cast<float>(projection.viewport.Height) * 0.5f;
+        screen_position.x = (normalized_x + 1.f) * static_cast<float>(projection.viewport_width) * 0.5f;
+        screen_position.y = (1.f - normalized_y) * static_cast<float>(projection.viewport_height) * 0.5f;
         return std::isfinite(screen_position.x) && std::isfinite(screen_position.y);
     }
 
@@ -944,7 +938,7 @@ void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
     }
     const auto* agents = GW::Agents::GetAgentArray();
     AgentProjection projection;
-    if (!agents || !GetAgentProjection(device, projection)) {
+    if (!agents || !GetAgentProjection(projection)) {
         return;
     }
     auto* draw_list = ImGui::GetForegroundDrawList();
