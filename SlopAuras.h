@@ -76,13 +76,15 @@ private:
 
     struct QueuedNotification {
         NotificationType type;
+        uint32_t skill_id;
         std::wstring path;
     };
 
     void TrackCast(int skill_id, uint32_t target_agent_id);
     void TrackEnemyCooldown(uint32_t agent_id, uint32_t skill_id);
     void PrintTrackedEffects();
-    void PlayNotification(NotificationType type);
+    void PlayNotification(NotificationType type, uint32_t skill_id = 0);
+    std::string ResolveNotificationSoundPath(NotificationType type, uint32_t skill_id) const;
     void NotificationWorker();
     void StopNotificationWorker();
     void SetNotificationsMuted(bool muted);
@@ -103,6 +105,11 @@ private:
     std::vector<int> cast_by_me_entries;
     std::vector<int> cooldown_ids;
     std::vector<std::string> natural_resistance_agent_names;
+    // Per-entry sound overrides, parallel to effect_ids / cooldown_ids. Empty entries fall back to the
+    // matching group-level sound in notification_sound_paths.
+    std::vector<std::string> effect_applied_sound_overrides;
+    std::vector<std::string> effect_expiring_sound_overrides;
+    std::vector<std::string> cooldown_sound_overrides;
     std::vector<TrackedCast> tracked_casts;
     std::vector<TrackedCooldown> tracked_cooldowns;
     std::vector<TrackedKnockdown> tracked_knockdowns;
@@ -121,8 +128,10 @@ private:
     bool notification_worker_stopping = false;
     bool notification_playing = false;
     NotificationType notification_playing_type = NotificationType::EffectApplied;
+    uint32_t notification_playing_skill_id = 0;
     float notification_lead_seconds = 3.f;
     bool settings_window_visible = false;
+    bool pending_welcome_message = false;
     bool widget_mode = false;
     bool enemy_nameplates_enabled = true;
     bool nameplate_show_knockdown = true;
