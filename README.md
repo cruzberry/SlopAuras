@@ -1,11 +1,17 @@
 # SlopAuras
 
-SlopAuras is a GWToolbox++ plugin that displays remaining durations for selected player effects.
+SlopAuras is a GWToolbox++ plugin that tracks selected player effects and enemy cooldowns.
 
-To configure tracked effects, open the SlopAuras section under Toolbox's **Settings > Plugins** and select **Open SlopAuras settings**. The settings window is drawn while the main SlopAuras window is visible. The SlopAuras window lists matching effects while they are active. Natural Resistance agents are configured by name, so the setting remains valid if an agent's model ID changes.
+Enemy nameplate overlays are enabled by default. They add knockdown status and its remaining timer, icons and estimated timers for configured tracked hexes and conditions, other configured player-effect timers, and configured enemy cooldown timers below the game's selectable enemy names. Untracked hexes, conditions, and enchantments are not displayed. Choose which information to show in **Settings > Plugins > SlopAuras > Open SlopAuras settings**. The overlay does not replace or intercept the game's nameplates.
 
-SlopAuras provides client-side chat commands: `/sa hide` hides its window, `/sa show` shows it, and `/sa help` lists the commands in chat.
+Configure tracked skills in the SlopAuras settings. PvE durations scale with title rank when available. Condition timers are estimates because the game does not expose exact remaining time. Configure Natural Resistance agents by name.
+
+Commands: `/sa` or `/sa show` or `/sa hide` (toggles the window), `/sa settings` or `/sa s` (toggles the settings window), `/sa print`, `/sa mute` or `/sa unmute` (toggles sound notifications), and `/sa help`. Print omits effects on configured Natural Resistance agents.
+
+Sound alerts are configurable for effect application, near-expiry, and enemy cooldown completion, with an optional custom WAV per individual tracked effect or cooldown that overrides the group default. Choose a WAV per event and set the expiry lead time. Alerts play sequentially through Windows audio; notifications start unmuted.
+
+The first time SlopAuras is loaded (no settings file yet), it prints a welcome chat message pointing to `/sa help` and `/sa s`.
 
 ## Building
 
-This plugin uses GWToolbox++ and GWCA interfaces and is built with the GWToolbox++ CMake project. To include it in that build, add the plugin source directory and register `SlopAuras` with `add_tb_plugin`.
+Build with the GWToolbox++ CMake project: add this plugin directory and register `SlopAuras` with `add_tb_plugin`.

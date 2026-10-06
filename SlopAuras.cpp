@@ -3,22 +3,40 @@
 #include <PluginUtils.h>
 
 #include <Windows.h>
+#include <commdlg.h>
+#include <cmath>
+#include <d3d9.h>
+#include <mmsystem.h>
 
 #include <cctype>
+#include <cfloat>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 
 #include <GWCA/Constants/Constants.h>
+#include <GWCA/Context/WorldContext.h>
 #include <GWCA/GameEntities/Agent.h>
 #include <GWCA/GameEntities/Attribute.h>
+#include <GWCA/GameEntities/Camera.h>
 #include <GWCA/GameEntities/Skill.h>
+#include <GWCA/GameEntities/Title.h>
 #include <GWCA/Managers/AgentMgr.h>
+#include <GWCA/Managers/CameraMgr.h>
 #include <GWCA/Managers/EffectMgr.h>
 #include <GWCA/Managers/GameThreadMgr.h>
 #include <GWCA/Managers/ItemMgr.h>
 #include <GWCA/Managers/MapMgr.h>
 #include <GWCA/Managers/MemoryMgr.h>
 #include <GWCA/Managers/PartyMgr.h>
+#include <GWCA/Managers/PlayerMgr.h>
 #include <GWCA/Managers/SkillbarMgr.h>
+#include <GWCA/Packets/StoC.h>
 #include <GWCA/Managers/UIMgr.h>
+
+#include <DirectXMath.h>
+#pragma comment(lib, "Comdlg32.lib")
+#pragma comment(lib, "Winmm.lib")
 
 extern "C" __declspec(dllimport) IDirect3DTexture9** __cdecl GetSkillImage(GW::Constants::SkillID skill_id);
 
@@ -51,13 +69,122 @@ namespace {
         return living && living->allegiance == GW::Constants::Allegiance::Enemy;
     }
 
-    bool IsTrackedCastType(const GW::Constants::SkillType type)
+    GW::Constants::SkillID GetConditionIconSkill(const uint32_t condition)
     {
-        return type == GW::Constants::SkillType::Hex
-            || type == GW::Constants::SkillType::Enchantment
-            || type == GW::Constants::SkillType::WeaponSpell
-            || type == GW::Constants::SkillType::Shout
-            || type == GW::Constants::SkillType::Ritual;
+        using GW::Constants::EffectID;
+        using GW::Constants::SkillID;
+        switch (condition) {
+        case static_cast<uint32_t>(EffectID::bleeding):
+        case static_cast<uint32_t>(SkillID::Bleeding):
+            return SkillID::Bleeding;
+        case static_cast<uint32_t>(EffectID::blind):
+        case static_cast<uint32_t>(SkillID::Blind):
+            return SkillID::Blind;
+        case static_cast<uint32_t>(EffectID::burning):
+        case static_cast<uint32_t>(SkillID::Burning):
+            return SkillID::Burning;
+        case static_cast<uint32_t>(SkillID::Crippled):
+            return SkillID::Crippled;
+        case static_cast<uint32_t>(SkillID::Deep_Wound):
+            return SkillID::Deep_Wound;
+        case static_cast<uint32_t>(EffectID::disease):
+        case static_cast<uint32_t>(SkillID::Disease):
+            return SkillID::Disease;
+        case static_cast<uint32_t>(EffectID::poison):
+        case static_cast<uint32_t>(SkillID::Poison):
+            return SkillID::Poison;
+        case static_cast<uint32_t>(EffectID::dazed):
+        case static_cast<uint32_t>(SkillID::Dazed):
+            return SkillID::Dazed;
+        case static_cast<uint32_t>(EffectID::weakness):
+        case static_cast<uint32_t>(SkillID::Weakness):
+            return SkillID::Weakness;
+        default:
+            return SkillID::No_Skill;
+        }
+    }
+
+    struct AgentProjection {
+        DirectX::XMMATRIX view_projection;
+        uint32_t viewport_width;
+        uint32_t viewport_height;
+    };
+
+    bool GetAgentProjection(AgentProjection& projection)
+    {
+        const auto* camera = GW::CameraMgr::GetCamera();
+        const auto viewport_width = GW::Render::GetViewportWidth();
+        const auto viewport_height = GW::Render::GetViewportHeight();
+        const auto fov = GW::Render::GetFieldOfView();
+        if (!camera || !viewport_width || !viewport_height || !std::isfinite(fov) || fov <= 0.f) {
+            return false;
+        }
+        const auto eye = DirectX::XMVectorSet(camera->position.x, camera->position.y, camera->position.z, 1.f);
+        const auto target = DirectX::XMVectorSet(camera->look_at_target.x, camera->look_at_target.y, camera->look_at_target.z, 1.f);
+        const auto up = DirectX::XMVectorSet(0.f, 0.f, -1.f, 0.f);
+        const auto view = DirectX::XMMatrixLookAtLH(eye, target, up);
+        const auto projection_matrix = DirectX::XMMatrixPerspectiveFovLH(
+            fov, static_cast<float>(viewport_width) / static_cast<float>(viewport_height), 0.1f, 100000.f);
+        projection.view_projection = DirectX::XMMatrixMultiply(view, projection_matrix);
+        projection.viewport_width = viewport_width;
+        projection.viewport_height = viewport_height;
+        return true;
+    }
+
+    bool ProjectAgentNameToScreen(const AgentProjection& projection, const GW::Agent* agent, ImVec2& screen_position)
+    {
+        if (!agent) {
+            return false;
+        }
+        const auto world_position = DirectX::XMVectorSet(agent->name_tag_x, agent->name_tag_y, agent->name_tag_z, 1.f);
+        const auto clip_position = DirectX::XMVector4Transform(world_position, projection.view_projection);
+        DirectX::XMFLOAT4 clip;
+        DirectX::XMStoreFloat4(&clip, clip_position);
+        if (!std::isfinite(clip.x) || !std::isfinite(clip.y) || !std::isfinite(clip.z)
+            || !std::isfinite(clip.w) || clip.w <= 0.f) {
+            return false;
+        }
+
+        const auto depth = clip.z / clip.w;
+        const auto normalized_x = clip.x / clip.w;
+        const auto normalized_y = clip.y / clip.w;
+        if (depth < 0.f || depth > 1.f || normalized_x < -1.f || normalized_x > 1.f
+            || normalized_y < -1.f || normalized_y > 1.f) {
+            return false;
+        }
+        screen_position.x = (normalized_x + 1.f) * static_cast<float>(projection.viewport_width) * 0.5f;
+        screen_position.y = (1.f - normalized_y) * static_cast<float>(projection.viewport_height) * 0.5f;
+        return std::isfinite(screen_position.x) && std::isfinite(screen_position.y);
+    }
+
+    bool IsTrackedCastType(const GW::Skill* skill)
+    {
+        return skill && (skill->type == GW::Constants::SkillType::Hex
+            || skill->type == GW::Constants::SkillType::Enchantment
+            || skill->type == GW::Constants::SkillType::WeaponSpell
+            || skill->type == GW::Constants::SkillType::Shout
+            || skill->type == GW::Constants::SkillType::Ritual
+            || skill->condition != 0);
+    }
+
+    bool IsMultiAllyEffect(const GW::Skill& skill)
+    {
+        switch (skill.skill_id) {
+        case GW::Constants::SkillID::Save_Yourselves_kurzick:
+        case GW::Constants::SkillID::Save_Yourselves_luxon:
+        case GW::Constants::SkillID::Dark_Fury:
+            return true;
+        default:
+            return (skill.type == GW::Constants::SkillType::Shout && skill.condition == 0)
+                || (skill.type == GW::Constants::SkillType::Enchantment && skill.aoe_range > 0.f);
+        }
+    }
+
+    bool IsEffectTimestampNearCast(const uint32_t effect_timestamp, const uint32_t cast_timestamp)
+    {
+        constexpr uint32_t match_window_ms = 3000;
+        return effect_timestamp - cast_timestamp <= match_window_ms
+            || cast_timestamp - effect_timestamp <= match_window_ms;
     }
 
     uint32_t GetAttributeLevel(const GW::Constants::AttributeByte attribute)
@@ -65,6 +192,34 @@ namespace {
         const auto* attributes = GW::PartyMgr::GetAgentAttributes(GW::Agents::GetControlledCharacterId());
         const auto attribute_id = static_cast<uint32_t>(attribute);
         return attributes && attribute_id < 54 ? attributes[attribute_id].level : 0;
+    }
+
+    float GetSkillDuration(const GW::Skill& skill)
+    {
+        const auto duration0 = static_cast<float>(skill.duration0);
+        const auto duration_delta = static_cast<float>(skill.duration15) - duration0;
+        if (skill.title != 0) {
+            const auto* title = GW::PlayerMgr::GetTitleTrack(static_cast<GW::Constants::TitleID>(skill.title));
+            const auto* world = GW::GetWorldContext();
+            if (!title || !world || !title->max_title_rank
+                || title->current_title_tier_index >= world->title_tiers.size()) {
+                return duration0;
+            }
+            // Vampirism's duration stops scaling at Sunspear rank 5.
+            const auto max_effective_rank = skill.skill_id == GW::Constants::SkillID::Vampirism
+                ? std::min(title->max_title_rank, 5u)
+                : title->max_title_rank;
+            const auto rank = std::min(world->title_tiers[title->current_title_tier_index].tier_number, max_effective_rank);
+            return duration0 + duration_delta * static_cast<float>(rank) / static_cast<float>(max_effective_rank);
+        }
+
+        if (skill.attribute == GW::Constants::AttributeByte::None) {
+            return duration0;
+        }
+        const auto attribute_level = GetAttributeLevel(skill.attribute);
+        return attribute_level > 0
+            ? duration0 + duration_delta * static_cast<float>(attribute_level) / 15.f
+            : duration0;
     }
 
     float GetEnchantingWeaponBonus()
@@ -85,22 +240,26 @@ namespace {
         return 0.f;
     }
 
-    bool IsAgentEffectActive(const uint32_t agent_id, const uint32_t skill_id, const GW::Constants::SkillType type)
+    bool IsAgentEffectActive(const uint32_t agent_id, const GW::Skill& skill)
     {
         const auto* agent = GW::Agents::GetAgentByID(agent_id);
         const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
         if (!living || !living->GetIsAlive()) {
             return false;
         }
+        if (skill.type == GW::Constants::SkillType::Hex) {
+            return living->GetIsHexed();
+        }
+        if (skill.condition != 0) {
+            return living->GetIsConditioned();
+        }
         const auto* effects = GW::Effects::GetAgentEffects(agent_id);
         if (effects) {
-            return std::ranges::any_of(*effects, [skill_id](const GW::Effect& effect) {
-                return static_cast<uint32_t>(effect.skill_id) == skill_id && effect.GetTimeRemaining() > 0;
+            return std::ranges::any_of(*effects, [&skill](const GW::Effect& effect) {
+                return effect.skill_id == skill.skill_id && effect.GetTimeRemaining() > 0;
             });
         }
-        switch (type) {
-        case GW::Constants::SkillType::Hex:
-            return living->GetIsHexed();
+        switch (skill.type) {
         case GW::Constants::SkillType::Enchantment:
             return living->GetIsEnchanted();
         case GW::Constants::SkillType::WeaponSpell:
@@ -191,12 +350,63 @@ namespace {
         const auto name = GetDecodedName(encoded);
         return name.empty() ? "Unknown target" : name;
     }
+
+    std::wstring ToWideString(const std::string& value)
+    {
+        if (value.empty()) {
+            return {};
+        }
+        const auto length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+            static_cast<int>(value.size()), nullptr, 0);
+        if (!length) {
+            return L"Unknown name";
+        }
+        std::wstring result(static_cast<size_t>(length), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+            static_cast<int>(value.size()), result.data(), length);
+        return result;
+    }
+
+    bool BrowseForWaveFile(std::string& selected_path)
+    {
+        std::array<wchar_t, 32768> path{};
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = GetForegroundWindow();
+        dialog.lpstrFilter = L"Wave audio (*.wav)\0*.wav\0\0";
+        dialog.lpstrFile = path.data();
+        dialog.nMaxFile = static_cast<DWORD>(path.size());
+        dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameW(&dialog)) {
+            if (CommDlgExtendedError()) {
+                OutputDebugStringW(L"SlopAuras: WAV file picker failed.\n");
+            }
+            return false;
+        }
+        const auto extension = PluginUtils::ToLower(std::filesystem::path(path.data()).extension().wstring());
+        if (extension != L".wav") {
+            return false;
+        }
+        const std::wstring wide_path(path.data());
+        if (wide_path.size() >= 256) {
+            GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2,
+                L"SlopAuras: notification WAV path must be shorter than 256 characters.", L"SlopAuras");
+            return false;
+        }
+        selected_path = PluginUtils::WStringToString(wide_path);
+        return !selected_path.empty();
+    }
 }
 
 DLLAPI ToolboxPlugin* ToolboxPluginInstance()
 {
     static SlopAuras instance;
     return &instance;
+}
+
+SlopAuras::~SlopAuras()
+{
+    StopNotificationWorker();
 }
 
 void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const int argc, const LPWSTR* argv)
@@ -208,39 +418,363 @@ void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const 
 
     const auto print_help = [] {
         GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa help - What you just typed!", L"SlopAuras");
-        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa hide - Hide the SlopAuras window.", L"SlopAuras");
-        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa show - Show the SlopAuras window.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa (no argument) / show / hide - Toggle the SlopAuras window.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa settings / s - Toggle the SlopAuras settings window.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa print - Print tracked effects and enemy cooldowns.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa mute / unmute - Toggle SlopAuras sound notifications.", L"SlopAuras");
     };
 
-    if (argc != 2 || !argv || !argv[1]) {
-        print_help();
+    auto* instance = static_cast<SlopAuras*>(ToolboxPluginInstance());
+
+    // Bare "/sa" behaves the same as "/sa show".
+    if (argc < 2 || !argv || !argv[1]) {
+        auto* visible = instance->GetVisiblePtr();
+        *visible = true;
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"SlopAuras: Window shown.", L"SlopAuras");
         return;
     }
 
     const auto subcommand = PluginUtils::ToLower(argv[1]);
-    auto* instance = static_cast<SlopAuras*>(ToolboxPluginInstance());
-    if (subcommand == L"hide") {
-        *instance->GetVisiblePtr() = false;
+    if (subcommand == L"hide" || subcommand == L"show") {
+        auto* visible = instance->GetVisiblePtr();
+        *visible = !*visible;
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, *visible ? L"SlopAuras: Window shown." : L"SlopAuras: Window hidden.", L"SlopAuras");
     }
-    else if (subcommand == L"show") {
-        *instance->GetVisiblePtr() = true;
+    else if (subcommand == L"settings" || subcommand == L"s") {
+        instance->settings_window_visible = !instance->settings_window_visible;
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, instance->settings_window_visible
+            ? L"SlopAuras: Settings window shown."
+            : L"SlopAuras: Settings window hidden.", L"SlopAuras");
+    }
+    else if (subcommand == L"print") {
+        instance->PrintTrackedEffects();
+    }
+    else if (subcommand == L"mute" || subcommand == L"unmute") {
+        const auto muted = !instance->notifications_muted.load(std::memory_order_acquire);
+        instance->SetNotificationsMuted(muted);
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, muted
+            ? L"SlopAuras: Sound notifications muted."
+            : L"SlopAuras: Sound notifications unmuted.", L"SlopAuras");
     }
     else {
         print_help();
     }
 }
 
+std::string SlopAuras::ResolveNotificationSoundPath(const NotificationType type, const uint32_t skill_id) const
+{
+    const auto index = static_cast<size_t>(type);
+    if (index >= notification_enabled.size() || !notification_enabled[index]) {
+        return {};
+    }
+
+    const auto find_override = [skill_id](const std::vector<int>& ids, const std::vector<std::string>& overrides) -> const std::string* {
+        const auto it = std::ranges::find(ids, static_cast<int>(skill_id));
+        if (it == ids.end()) {
+            return nullptr;
+        }
+        const auto entry_index = static_cast<size_t>(it - ids.begin());
+        return entry_index < overrides.size() && !overrides[entry_index].empty() ? &overrides[entry_index] : nullptr;
+    };
+
+    const std::string* override_path = nullptr;
+    if (skill_id) {
+        switch (type) {
+            case NotificationType::EffectApplied:
+                override_path = find_override(effect_ids, effect_applied_sound_overrides);
+                break;
+            case NotificationType::EffectExpiring:
+                override_path = find_override(effect_ids, effect_expiring_sound_overrides);
+                break;
+            case NotificationType::CooldownReady:
+                override_path = find_override(cooldown_ids, cooldown_sound_overrides);
+                break;
+            default:
+                break;
+        }
+    }
+    return override_path ? *override_path : notification_sound_paths[index];
+}
+
+void SlopAuras::PlayNotification(const NotificationType type, const uint32_t skill_id)
+{
+    if (notifications_muted.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::string path;
+    {
+        std::lock_guard lock(tracking_mutex);
+        path = ResolveNotificationSoundPath(type, skill_id);
+    }
+    if (path.empty()) {
+        return;
+    }
+
+    auto wide_path = PluginUtils::StringToWString(path);
+    if (wide_path.empty()) {
+        OutputDebugStringW(L"SlopAuras: selected notification WAV path could not be converted.\n");
+        return;
+    }
+    {
+        std::lock_guard lock(notification_queue_mutex);
+        if (notification_worker_stopping) {
+            return;
+        }
+        if ((notification_playing && notification_playing_type == type && notification_playing_skill_id == skill_id)
+            || std::ranges::any_of(notification_queue, [type, skill_id](const QueuedNotification& queued) {
+                return queued.type == type && queued.skill_id == skill_id;
+            })) {
+            return;
+        }
+        notification_queue.push_back({type, skill_id, std::move(wide_path)});
+    }
+    notification_condition.notify_one();
+}
+
+void SlopAuras::NotificationWorker()
+{
+    std::unique_lock lock(notification_queue_mutex);
+    for (;;) {
+        notification_condition.wait(lock, [this] {
+            return notification_worker_stopping || !notification_queue.empty();
+        });
+        if (notification_worker_stopping && notification_queue.empty()) {
+            return;
+        }
+        auto notification = std::move(notification_queue.front());
+        notification_queue.pop_front();
+        notification_playing = true;
+        notification_playing_type = notification.type;
+        notification_playing_skill_id = notification.skill_id;
+        lock.unlock();
+        if (!notifications_muted.load(std::memory_order_acquire)
+            && !PlaySoundW(notification.path.c_str(), nullptr, SND_FILENAME | SND_SYNC | SND_NODEFAULT)) {
+            OutputDebugStringW(L"SlopAuras: failed to play the selected notification WAV file.\n");
+        }
+        lock.lock();
+        notification_playing = false;
+    }
+}
+
+void SlopAuras::StopNotificationWorker()
+{
+    {
+        std::lock_guard lock(notification_queue_mutex);
+        notification_worker_stopping = true;
+        notification_queue.clear();
+    }
+    PlaySoundW(nullptr, nullptr, 0);
+    notification_condition.notify_all();
+    if (notification_worker.joinable()) {
+        notification_worker.join();
+    }
+}
+
+void SlopAuras::SetNotificationsMuted(const bool muted)
+{
+    notifications_muted.store(muted, std::memory_order_release);
+    if (!muted) {
+        return;
+    }
+    {
+        std::lock_guard lock(notification_queue_mutex);
+        notification_queue.clear();
+    }
+    PlaySoundW(nullptr, nullptr, 0);
+}
+
+void SlopAuras::PrintTrackedEffects()
+{
+    if (!IsMapReady()) {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"SlopAuras: Map is not ready.", L"SlopAuras");
+        return;
+    }
+
+    const auto generation = map_generation.load(std::memory_order_acquire);
+    const auto now = GW::MemoryMgr::GetSkillTimer();
+    std::vector<int> tracked_skill_ids;
+    std::vector<int> cast_by_me_snapshot;
+    std::vector<int> cooldown_ids_snapshot;
+    std::vector<std::string> natural_resistance_names;
+    std::vector<TrackedCast> tracked_casts_snapshot;
+    std::vector<TrackedCooldown> tracked_cooldowns_snapshot;
+    {
+        std::lock_guard lock(tracking_mutex);
+        tracked_skill_ids = effect_ids;
+        cast_by_me_snapshot = cast_by_me_entries;
+        cooldown_ids_snapshot = cooldown_ids;
+        natural_resistance_names = natural_resistance_agent_names;
+        tracked_casts_snapshot = tracked_casts;
+        tracked_cooldowns_snapshot = tracked_cooldowns;
+    }
+
+    struct ActiveEffect {
+        int skill_id;
+        uint32_t target_agent_id;
+        DWORD remaining;
+    };
+    std::vector<ActiveEffect> active_effects;
+    const auto add_active_effect = [&active_effects](const int skill_id, const uint32_t target_agent_id, const DWORD remaining) {
+        const auto existing = std::ranges::find_if(active_effects, [skill_id, target_agent_id](const ActiveEffect& effect) {
+            return effect.skill_id == skill_id && effect.target_agent_id == target_agent_id;
+        });
+        if (existing == active_effects.end()) {
+            active_effects.push_back({skill_id, target_agent_id, remaining});
+        }
+        else {
+            existing->remaining = std::max(existing->remaining, remaining);
+        }
+    };
+    const auto effects = GW::Effects::GetPlayerEffects();
+    for (size_t entry_index = 0; entry_index < tracked_skill_ids.size(); ++entry_index) {
+        if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+            return;
+        }
+        const auto skill_id = tracked_skill_ids[entry_index];
+        if (skill_id <= 0) {
+            continue;
+        }
+
+        const auto cast_by_me = std::ranges::find(cast_by_me_snapshot, static_cast<int>(entry_index)) != cast_by_me_snapshot.end();
+        if (effects && !cast_by_me) {
+            DWORD remaining = 0;
+            for (const auto& effect : *effects) {
+                if (static_cast<int>(effect.skill_id) == skill_id) {
+                    remaining = std::max(remaining, effect.GetTimeRemaining());
+                }
+            }
+            if (remaining > 0) {
+                add_active_effect(skill_id, GW::Agents::GetControlledCharacterId(), remaining);
+            }
+        }
+
+        for (const auto& cast : tracked_casts_snapshot) {
+            if (static_cast<int>(cast.skill_id) != skill_id) {
+                continue;
+            }
+            const auto elapsed = now - cast.timestamp;
+            const auto predicted_remaining = elapsed < cast.duration_ms ? cast.duration_ms - elapsed : 0;
+            const auto remaining = std::max(predicted_remaining, cast.observed_remaining_ms);
+            if (!remaining) {
+                continue;
+            }
+            if (!cast.multi_ally && elapsed >= 1500) {
+                const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast.skill_id));
+                if (skill && (skill->type != GW::Constants::SkillType::Ritual || skill->condition != 0)
+                    && !IsAgentEffectActive(cast.target_agent_id, *skill)) {
+                    continue;
+                }
+            }
+            add_active_effect(skill_id, cast.multi_ally ? 0 : cast.target_agent_id, remaining);
+        }
+    }
+
+    const auto is_natural_resistance_enemy = [&natural_resistance_names](const uint32_t agent_id) {
+        if (!IsEnemyAgent(agent_id)) {
+            return false;
+        }
+        const auto target_name = NormalizeAgentName(GetAgentName(agent_id));
+        return !target_name.empty() && target_name != "loading name..." && target_name != "unknown target"
+            && std::ranges::any_of(natural_resistance_names, [&target_name](const std::string& name) {
+                return NormalizeAgentName(name) == target_name;
+            });
+    };
+
+    std::vector<std::wstring> messages;
+    for (const auto& effect : active_effects) {
+        if (is_natural_resistance_enemy(effect.target_agent_id)) {
+            continue;
+        }
+        const auto target_name = effect.target_agent_id == 0
+            ? std::string("allies")
+            : effect.target_agent_id == GW::Agents::GetControlledCharacterId()
+                ? std::string("you")
+                : GetAgentName(effect.target_agent_id);
+        std::ostringstream message;
+        message << "Effect: " << GetSkillName(effect.skill_id) << " on " << target_name << " - "
+            << std::fixed << std::setprecision(1) << static_cast<double>(effect.remaining) / 1000.0 << "s remaining";
+        messages.push_back(ToWideString(message.str()));
+    }
+
+    for (const auto& cooldown : tracked_cooldowns_snapshot) {
+        if (std::ranges::find(cooldown_ids_snapshot, static_cast<int>(cooldown.skill_id)) == cooldown_ids_snapshot.end()
+            || is_natural_resistance_enemy(cooldown.agent_id)) {
+            continue;
+        }
+        const auto elapsed = now - cooldown.timestamp;
+        if (elapsed >= cooldown.duration_ms) {
+            continue;
+        }
+        std::ostringstream message;
+        message << "Cooldown: " << GetSkillName(static_cast<int>(cooldown.skill_id)) << " on "
+            << GetAgentName(cooldown.agent_id) << " - " << std::fixed << std::setprecision(1)
+            << static_cast<double>(cooldown.duration_ms - elapsed) / 1000.0 << "s remaining";
+        messages.push_back(ToWideString(message.str()));
+    }
+
+    if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+        return;
+    }
+    if (messages.empty()) {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"SlopAuras: No tracked effects or cooldowns active.", L"SlopAuras");
+        return;
+    }
+    for (const auto& message : messages) {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, message.c_str(), L"SlopAuras");
+    }
+}
+
 void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODULE toolbox_dll)
 {
     ToolboxUIPlugin::Initialize(ctx, allocator_fns, toolbox_dll);
+    {
+        std::lock_guard lock(notification_queue_mutex);
+        notification_worker_stopping = false;
+    }
+    notification_worker = std::thread(&SlopAuras::NotificationWorker, this);
     GW::Chat::CreateCommand(&chat_command_hook, L"sa", HandleChatCommand);
     GW::UI::RegisterUIMessageCallback(&map_loading_hook, GW::UI::UIMessage::kLoadMapContext, [this](GW::HookStatus*, GW::UI::UIMessage, void*, void*) {
         map_generation.fetch_add(1, std::memory_order_acq_rel);
         std::lock_guard lock(tracking_mutex);
         tracked_casts.clear();
         tracked_cooldowns.clear();
+        tracked_knockdowns.clear();
         pending_casts.clear();
+        player_effect_notifications.clear();
+        player_effect_snapshot_initialized = false;
     });
+    const auto knockdown_callback_registered = GW::StoC::RegisterPacketCallback<GW::Packet::StoC::GenericFloat>(&knockdown_hook, [this](GW::HookStatus*, GW::Packet::StoC::GenericFloat* packet) {
+        if (!packet || packet->type != GW::Packet::StoC::GenericValueID::knocked_down
+            || !IsMapReady() || !std::isfinite(packet->value) || packet->value <= 0.f
+            || !IsEnemyAgent(packet->agent_id)) {
+            return;
+        }
+        const auto duration_ms_value = static_cast<double>(packet->value) * 1000.0;
+        if (duration_ms_value > static_cast<double>(std::numeric_limits<uint32_t>::max())) {
+            return;
+        }
+        const auto generation = map_generation.load(std::memory_order_acquire);
+        const auto now = GW::MemoryMgr::GetSkillTimer();
+        const auto duration_ms = static_cast<uint32_t>(duration_ms_value);
+        std::lock_guard lock(tracking_mutex);
+        if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+            return;
+        }
+        const auto existing = std::ranges::find_if(tracked_knockdowns, [packet](const TrackedKnockdown& knockdown) {
+            return knockdown.agent_id == packet->agent_id;
+        });
+        if (existing != tracked_knockdowns.end()) {
+            existing->timestamp = now;
+            existing->duration_ms = duration_ms;
+        }
+        else {
+            tracked_knockdowns.push_back({packet->agent_id, now, duration_ms});
+        }
+    });
+    if (!knockdown_callback_registered) {
+        OutputDebugStringW(L"SlopAuras: could not register the enemy knockdown timer callback.\n");
+    }
     GW::UI::RegisterUIMessageCallback(&skill_started_cast_hook, GW::UI::UIMessage::kAgentSkillStartedCast, [this](GW::HookStatus*, GW::UI::UIMessage, void* wparam, void*) {
         const auto* packet = static_cast<GW::UI::UIPacket::kAgentSkillStartedCast*>(wparam);
         if (!packet || !IsMapReady()
@@ -253,7 +787,7 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
             return;
         }
         const auto* skill = GW::SkillbarMgr::GetSkillConstantData(packet->skill_id);
-        if (!skill || !IsTrackedCastType(skill->type)) {
+        if (!IsTrackedCastType(skill)) {
             return;
         }
         const auto now = GW::MemoryMgr::GetSkillTimer();
@@ -327,14 +861,19 @@ void SlopAuras::SignalTerminate()
 
 void SlopAuras::Terminate()
 {
+    StopNotificationWorker();
     GW::UI::RemoveUIMessageCallback(&skill_activated_hook);
     GW::UI::RemoveUIMessageCallback(&skill_started_cast_hook);
     GW::UI::RemoveUIMessageCallback(&map_loading_hook);
+    GW::StoC::RemoveCallback<GW::Packet::StoC::GenericFloat>(&knockdown_hook);
     {
         std::lock_guard lock(tracking_mutex);
         tracked_casts.clear();
         tracked_cooldowns.clear();
+        tracked_knockdowns.clear();
         pending_casts.clear();
+        player_effect_notifications.clear();
+        player_effect_snapshot_initialized = false;
     }
     ToolboxUIPlugin::Terminate();
 }
@@ -358,19 +897,335 @@ void SlopAuras::Update(float delta)
     if (!IsMapReady()) {
         return;
     }
+    if (pending_welcome_message) {
+        pending_welcome_message = false;
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2,
+            L"Welcome to SlopAuras! Type /sa help to list commands and /sa s to open settings. Enjoy!", L"SlopAuras");
+    }
     const auto now = GW::MemoryMgr::GetSkillTimer();
-    std::lock_guard lock(tracking_mutex);
-    std::erase_if(tracked_cooldowns, [this, generation, now](const TrackedCooldown& cooldown) {
-        if (now - cooldown.timestamp >= cooldown.duration_ms) {
-            return true;
+    struct PendingNotificationEvent {
+        NotificationType type;
+        uint32_t skill_id;
+    };
+    std::vector<PendingNotificationEvent> pending_notifications;
+    const auto player_effects = GW::Effects::GetPlayerEffects();
+    bool has_multi_ally_cast = false;
+    {
+        std::lock_guard lock(tracking_mutex);
+        has_multi_ally_cast = std::ranges::any_of(tracked_casts, [](const TrackedCast& cast) {
+            return cast.multi_ally;
+        });
+    }
+    struct PartyEffectSnapshot {
+        uint32_t skill_id;
+        uint32_t timestamp;
+        uint32_t remaining_ms;
+    };
+    std::vector<PartyEffectSnapshot> party_effect_snapshot;
+    if (has_multi_ally_cast) {
+        const auto* party_effects = GW::Effects::GetPartyEffectsArray();
+        if (party_effects && party_effects->valid()) {
+            for (const auto& agent_effects : *party_effects) {
+                if (!agent_effects.effects.valid()) {
+                    continue;
+                }
+                for (const auto& effect : agent_effects.effects) {
+                    const auto remaining = effect.GetTimeRemaining();
+                    if (remaining) {
+                        party_effect_snapshot.push_back({
+                            static_cast<uint32_t>(effect.skill_id),
+                            effect.timestamp,
+                            remaining
+                        });
+                    }
+                }
+            }
         }
-        if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
-            return true;
+    }
+    {
+        std::lock_guard lock(tracking_mutex);
+        const auto tracked_effects_changed = player_effect_ids_snapshot != effect_ids
+            || player_cast_by_me_snapshot != cast_by_me_entries;
+        player_effect_ids_snapshot = effect_ids;
+        player_cast_by_me_snapshot = cast_by_me_entries;
+
+        if (player_effects) {
+            std::vector<PlayerEffectNotification> current_player_effects;
+            for (const auto& effect : *player_effects) {
+                const auto skill_id = static_cast<uint32_t>(effect.skill_id);
+                if (!effect.duration || !effect.GetTimeRemaining()
+                    || std::ranges::find(effect_ids, static_cast<int>(skill_id)) == effect_ids.end()
+                    || std::ranges::any_of(cast_by_me_entries, [this, skill_id](const int entry) {
+                        return entry >= 0 && static_cast<size_t>(entry) < effect_ids.size()
+                            && effect_ids[entry] == static_cast<int>(skill_id);
+                    })) {
+                    continue;
+                }
+                if (std::ranges::find_if(current_player_effects, [skill_id, &effect](const PlayerEffectNotification& tracked) {
+                    return tracked.skill_id == skill_id && tracked.timestamp == effect.timestamp;
+                }) != current_player_effects.end()) {
+                    continue;
+                }
+                const auto previous = std::ranges::find_if(player_effect_notifications, [skill_id, &effect](const PlayerEffectNotification& tracked) {
+                    return tracked.skill_id == skill_id && tracked.timestamp == effect.timestamp;
+                });
+                const auto is_new = previous == player_effect_notifications.end();
+                current_player_effects.push_back({
+                    skill_id,
+                    effect.timestamp,
+                    !is_new && previous->expiration_notified
+                });
+                if (is_new && player_effect_snapshot_initialized && !tracked_effects_changed
+                    && notification_enabled[static_cast<size_t>(NotificationType::EffectApplied)]) {
+                    pending_notifications.push_back({NotificationType::EffectApplied, skill_id});
+                }
+                auto& tracked = current_player_effects.back();
+                const auto remaining = effect.GetTimeRemaining();
+                if (!tracked.expiration_notified
+                    && remaining <= static_cast<DWORD>(notification_lead_seconds * 1000.f)
+                    && notification_enabled[static_cast<size_t>(NotificationType::EffectExpiring)]) {
+                    tracked.expiration_notified = true;
+                    pending_notifications.push_back({NotificationType::EffectExpiring, skill_id});
+                }
+            }
+            player_effect_notifications = std::move(current_player_effects);
+            player_effect_snapshot_initialized = true;
         }
-        const auto* agent = GW::Agents::GetAgentByID(cooldown.agent_id);
-        const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
-        return !living || !living->GetIsAlive() || living->allegiance != GW::Constants::Allegiance::Enemy;
-    });
+
+        for (auto cast = tracked_casts.begin(); cast != tracked_casts.end();) {
+            const auto elapsed = now - cast->timestamp;
+            const auto since_observed = now - cast->observed_updated_timestamp;
+            cast->observed_remaining_ms = since_observed < cast->observed_remaining_ms
+                ? cast->observed_remaining_ms - since_observed
+                : 0;
+            cast->observed_updated_timestamp = now;
+            if (cast->multi_ally) {
+                for (const auto& effect : party_effect_snapshot) {
+                    if (effect.skill_id == cast->skill_id
+                        && IsEffectTimestampNearCast(effect.timestamp, cast->timestamp)) {
+                        cast->observed_remaining_ms = std::max(
+                            cast->observed_remaining_ms,
+                            effect.remaining_ms);
+                    }
+                }
+            }
+            if (elapsed >= cast->duration_ms && !cast->observed_remaining_ms) {
+                cast = tracked_casts.erase(cast);
+                continue;
+            }
+            if (!cast->multi_ally && elapsed >= 1500) {
+                if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+                    cast = tracked_casts.erase(cast);
+                    continue;
+                }
+                const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast->skill_id));
+                if (skill && (skill->type != GW::Constants::SkillType::Ritual || skill->condition != 0)
+                    && !IsAgentEffectActive(cast->target_agent_id, *skill)) {
+                    cast = tracked_casts.erase(cast);
+                    continue;
+                }
+            }
+            const auto predicted_remaining = elapsed < cast->duration_ms ? cast->duration_ms - elapsed : 0;
+            const auto remaining = std::max(predicted_remaining, cast->observed_remaining_ms);
+            if (!cast->expiration_notified
+                && remaining <= static_cast<uint32_t>(notification_lead_seconds * 1000.f)
+                && notification_enabled[static_cast<size_t>(NotificationType::EffectExpiring)]) {
+                cast->expiration_notified = true;
+                pending_notifications.push_back({NotificationType::EffectExpiring, cast->skill_id});
+            }
+            ++cast;
+        }
+        std::erase_if(tracked_cooldowns, [this, generation, now, &pending_notifications](const TrackedCooldown& cooldown) {
+            if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+                return true;
+            }
+            const auto* agent = GW::Agents::GetAgentByID(cooldown.agent_id);
+            const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
+            if (!living || !living->GetIsAlive() || living->allegiance != GW::Constants::Allegiance::Enemy) {
+                return true;
+            }
+            if (now - cooldown.timestamp < cooldown.duration_ms) {
+                return false;
+            }
+            if (notification_enabled[static_cast<size_t>(NotificationType::CooldownReady)]) {
+                pending_notifications.push_back({NotificationType::CooldownReady, cooldown.skill_id});
+            }
+            return true;
+        });
+        std::erase_if(tracked_knockdowns, [this, now](const TrackedKnockdown& knockdown) {
+            if (now - knockdown.timestamp >= knockdown.duration_ms) {
+                return true;
+            }
+            const auto* agent = GW::Agents::GetAgentByID(knockdown.agent_id);
+            const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
+            return !living || !living->GetIsAlive() || living->allegiance != GW::Constants::Allegiance::Enemy;
+        });
+    }
+    for (const auto& event : pending_notifications) {
+        PlayNotification(event.type, event.skill_id);
+    }
+}
+
+void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
+{
+    if (!enemy_nameplates_enabled || !device || !IsMapReady()) {
+        return;
+    }
+
+    const auto generation = map_generation.load(std::memory_order_acquire);
+    const auto now = GW::MemoryMgr::GetSkillTimer();
+    std::vector<int> tracked_effect_ids;
+    std::vector<int> tracked_cooldown_ids;
+    std::vector<TrackedCast> casts;
+    std::vector<TrackedCooldown> cooldowns;
+    std::vector<TrackedKnockdown> knockdowns;
+    {
+        std::lock_guard lock(tracking_mutex);
+        tracked_effect_ids = effect_ids;
+        tracked_cooldown_ids = cooldown_ids;
+        casts = tracked_casts;
+        cooldowns = tracked_cooldowns;
+        knockdowns = tracked_knockdowns;
+    }
+
+    if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+        return;
+    }
+    const auto* agents = GW::Agents::GetAgentArray();
+    AgentProjection projection;
+    if (!agents || !GetAgentProjection(projection)) {
+        return;
+    }
+    auto* draw_list = ImGui::GetForegroundDrawList();
+    for (const auto* agent : *agents) {
+        if (!agent || generation != map_generation.load(std::memory_order_acquire)) {
+            continue;
+        }
+        const auto* living = agent->GetAsAgentLiving();
+        if (!living || !living->GetIsAlive() || living->allegiance != GW::Constants::Allegiance::Enemy) {
+            continue;
+        }
+
+        struct NameplateLine {
+            std::string text;
+            ImU32 color;
+            IDirect3DTexture9* icon = nullptr;
+        };
+        std::vector<NameplateLine> lines;
+        if (nameplate_show_knockdown && living->GetIsKnockedDown()) {
+            const auto timer = std::ranges::find_if(knockdowns, [agent](const TrackedKnockdown& knockdown) {
+                return knockdown.agent_id == agent->agent_id;
+            });
+            if (timer != knockdowns.end() && now - timer->timestamp < timer->duration_ms) {
+                const auto remaining = timer->duration_ms - (now - timer->timestamp);
+                lines.emplace_back(std::format("DOWN  {:.1f}s", static_cast<double>(remaining) / 1000.0),
+                    IM_COL32(255, 90, 80, 255));
+            }
+            else {
+                lines.emplace_back("KNOCKED DOWN", IM_COL32(255, 90, 80, 255));
+            }
+        }
+
+        if (nameplate_show_effects) {
+            for (const auto& cast : casts) {
+                if (cast.target_agent_id != agent->agent_id
+                    || std::ranges::find(tracked_effect_ids, static_cast<int>(cast.skill_id)) == tracked_effect_ids.end()) {
+                    continue;
+                }
+                const auto elapsed = now - cast.timestamp;
+                if (elapsed >= cast.duration_ms) {
+                    continue;
+                }
+                const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast.skill_id));
+                if (!skill) {
+                    continue;
+                }
+                auto icon_skill_id = GW::Constants::SkillID::No_Skill;
+                if (skill->type == GW::Constants::SkillType::Hex) {
+                    icon_skill_id = static_cast<GW::Constants::SkillID>(cast.skill_id);
+                }
+                else if (skill->condition != 0) {
+                    icon_skill_id = GetConditionIconSkill(skill->condition);
+                    if (icon_skill_id == GW::Constants::SkillID::No_Skill) {
+                        icon_skill_id = static_cast<GW::Constants::SkillID>(cast.skill_id);
+                    }
+                }
+                IDirect3DTexture9* icon_texture = nullptr;
+                if (icon_skill_id != GW::Constants::SkillID::No_Skill) {
+                    const auto icon = GetSkillImage(icon_skill_id);
+                    icon_texture = icon && *icon ? *icon : nullptr;
+                }
+                const auto remaining = std::format("{:.1f}s",
+                    static_cast<double>(cast.duration_ms - elapsed) / 1000.0);
+                if (skill->type == GW::Constants::SkillType::Hex || skill->condition != 0) {
+                    lines.push_back({remaining, IM_COL32(190, 225, 255, 255), icon_texture});
+                }
+                else {
+                    lines.push_back({std::format("{}  {}", GetSkillName(static_cast<int>(cast.skill_id)), remaining),
+                        IM_COL32(190, 225, 255, 255)});
+                }
+            }
+        }
+
+        if (nameplate_show_cooldowns) {
+            for (const auto& cooldown : cooldowns) {
+                if (cooldown.agent_id != agent->agent_id
+                    || std::ranges::find(tracked_cooldown_ids, static_cast<int>(cooldown.skill_id)) == tracked_cooldown_ids.end()) {
+                    continue;
+                }
+                const auto elapsed = now - cooldown.timestamp;
+                if (elapsed >= cooldown.duration_ms) {
+                    continue;
+                }
+                const auto name = GetSkillName(static_cast<int>(cooldown.skill_id));
+                lines.push_back({std::format("CD {}  {:.1f}s", name,
+                    static_cast<double>(cooldown.duration_ms - elapsed) / 1000.0), IM_COL32(255, 190, 135, 255)});
+            }
+        }
+
+        if (lines.empty()) {
+            continue;
+        }
+        ImVec2 name_position;
+        if (!ProjectAgentNameToScreen(projection, agent, name_position)) {
+            continue;
+        }
+
+        std::vector<ImVec2> text_sizes;
+        text_sizes.reserve(lines.size());
+        float max_width = 0.f;
+        float total_height = 0.f;
+        for (const auto& line : lines) {
+            const auto text_size = ImGui::CalcTextSize(line.text.c_str());
+            text_sizes.push_back(text_size);
+            const auto line_width = text_size.x + (line.icon ? effect_icon_size + 4.f : 0.f);
+            max_width = std::max(max_width, line_width);
+            total_height += std::max(text_size.y, line.icon ? effect_icon_size : 0.f);
+        }
+        constexpr float vertical_spacing = 1.f;
+        total_height += vertical_spacing * static_cast<float>(lines.size() - 1);
+        const auto left = name_position.x - max_width * 0.5f - 3.f;
+        const auto top = name_position.y + 7.f;
+        draw_list->AddRectFilled(ImVec2(left, top - 1.f),
+            ImVec2(left + max_width + 6.f, top + total_height + 1.f), IM_COL32(0, 0, 0, 170), 2.f);
+        auto y = top;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            const auto& line = lines[i];
+            const auto row_height = std::max(text_sizes[i].y, line.icon ? effect_icon_size : 0.f);
+            const auto row_width = text_sizes[i].x + (line.icon ? effect_icon_size + 4.f : 0.f);
+            auto x = name_position.x - row_width * 0.5f;
+            if (line.icon) {
+                const auto icon_y = y + (row_height - effect_icon_size) * 0.5f;
+                draw_list->AddImage((ImTextureID)(intptr_t)line.icon, ImVec2(x, icon_y),
+                    ImVec2(x + effect_icon_size, icon_y + effect_icon_size));
+                x += effect_icon_size + 4.f;
+            }
+            if (!line.text.empty()) {
+                draw_list->AddText(ImVec2(x, y + (row_height - text_sizes[i].y) * 0.5f), line.color, line.text.c_str());
+            }
+            y += row_height + vertical_spacing;
+        }
+    }
 }
 
 void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
@@ -382,20 +1237,12 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
     }
 
     const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(skill_id));
-    if (!skill || !IsTrackedCastType(skill->type) || skill->duration0 == 0
+    if (!IsTrackedCastType(skill) || skill->duration0 == 0
         || skill->duration0 >= 0x20000 || skill->duration15 >= 0x20000) {
         return;
     }
 
-    uint32_t attribute_level = 0;
-    if (skill->attribute != GW::Constants::AttributeByte::None) {
-        attribute_level = GetAttributeLevel(skill->attribute);
-    }
-
-    auto duration = static_cast<float>(skill->duration0);
-    if (attribute_level > 0) {
-        duration += (static_cast<float>(skill->duration15) - static_cast<float>(skill->duration0)) * attribute_level / 15.f;
-    }
+    auto duration = GetSkillDuration(*skill);
     if (skill->type == GW::Constants::SkillType::WeaponSpell) {
         duration *= 1.f + GetAttributeLevel(GW::Constants::AttributeByte::SpawningPower) * 0.04f;
     }
@@ -411,14 +1258,19 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
         return;
     }
 
+    const auto multi_ally = IsMultiAllyEffect(*skill);
     const auto target_id = skill->type == GW::Constants::SkillType::Ritual
         ? GW::Agents::GetControlledCharacterId()
         : target_agent_id ? target_agent_id : GW::Agents::GetControlledCharacterId();
-    const auto resolved_target_id = (skill->type == GW::Constants::SkillType::WeaponSpell
-        || skill->type == GW::Constants::SkillType::Enchantment) && IsEnemyAgent(target_id)
-        ? GW::Agents::GetControlledCharacterId()
-        : target_id;
-    std::lock_guard lock(tracking_mutex);
+    auto resolved_target_id = target_id;
+    if (multi_ally) {
+        resolved_target_id = 0;
+    }
+    else if ((skill->type == GW::Constants::SkillType::WeaponSpell
+        || skill->type == GW::Constants::SkillType::Enchantment) && IsEnemyAgent(target_id)) {
+        resolved_target_id = GW::Agents::GetControlledCharacterId();
+    }
+    std::unique_lock lock(tracking_mutex);
     if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
         return;
     }
@@ -430,8 +1282,8 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
     })) {
         return;
     }
-    const auto target_name = NormalizeAgentName(GetAgentName(resolved_target_id));
-    if (skill->type == GW::Constants::SkillType::Hex
+    const auto target_name = resolved_target_id ? NormalizeAgentName(GetAgentName(resolved_target_id)) : std::string{};
+    if (!multi_ally && skill->type == GW::Constants::SkillType::Hex
         && !target_name.empty() && target_name != "loading name..." && target_name != "unknown target"
         && std::ranges::any_of(natural_resistance_agent_names, [&target_name](const std::string& name) {
             return NormalizeAgentName(name) == target_name;
@@ -443,7 +1295,7 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
     }
     const auto now = GW::MemoryMgr::GetSkillTimer();
     std::erase_if(tracked_casts, [now](const TrackedCast& cast) {
-        return now - cast.timestamp >= cast.duration_ms;
+        return now - cast.timestamp >= cast.duration_ms && !cast.observed_remaining_ms;
     });
     if (skill->type == GW::Constants::SkillType::WeaponSpell) {
         std::erase_if(tracked_casts, [resolved_target_id](const TrackedCast& cast) {
@@ -452,15 +1304,34 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
                 && tracked_skill->type == GW::Constants::SkillType::WeaponSpell;
         });
     }
-    const auto existing = std::ranges::find_if(tracked_casts, [skill_id, resolved_target_id](const TrackedCast& cast) {
-        return cast.skill_id == static_cast<uint32_t>(skill_id) && cast.target_agent_id == resolved_target_id;
+    const auto existing = std::ranges::find_if(tracked_casts, [skill_id, resolved_target_id, multi_ally](const TrackedCast& cast) {
+        return cast.skill_id == static_cast<uint32_t>(skill_id)
+            && cast.target_agent_id == resolved_target_id
+            && cast.multi_ally == multi_ally;
     });
     if (existing != tracked_casts.end()) {
         existing->timestamp = now;
         existing->duration_ms = duration_ms;
+        existing->observed_remaining_ms = 0;
+        existing->observed_updated_timestamp = now;
+        existing->expiration_notified = false;
     }
     else {
-        tracked_casts.push_back({static_cast<uint32_t>(skill_id), resolved_target_id, now, duration_ms});
+        tracked_casts.push_back({
+            static_cast<uint32_t>(skill_id),
+            resolved_target_id,
+            now,
+            duration_ms,
+            false,
+            multi_ally,
+            0,
+            now
+        });
+    }
+    const auto notify_applied = notification_enabled[static_cast<size_t>(NotificationType::EffectApplied)];
+    lock.unlock();
+    if (notify_applied) {
+        PlayNotification(NotificationType::EffectApplied, static_cast<uint32_t>(skill_id));
     }
 }
 
@@ -480,15 +1351,25 @@ void SlopAuras::TrackEnemyCooldown(const uint32_t agent_id, const uint32_t skill
 
     const auto now = GW::MemoryMgr::GetSkillTimer();
     const auto duration_ms = skill->recharge * 1000u;
-    std::lock_guard lock(tracking_mutex);
+    std::unique_lock lock(tracking_mutex);
     if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
         return;
     }
     if (std::ranges::find(cooldown_ids, static_cast<int>(skill_id)) == cooldown_ids.end()) {
         return;
     }
-    std::erase_if(tracked_cooldowns, [now](const TrackedCooldown& cooldown) {
-        return now - cooldown.timestamp >= cooldown.duration_ms;
+    std::vector<uint32_t> ready_cooldown_skill_ids;
+    std::erase_if(tracked_cooldowns, [this, now, &ready_cooldown_skill_ids](const TrackedCooldown& cooldown) {
+        if (now - cooldown.timestamp < cooldown.duration_ms) {
+            return false;
+        }
+        const auto* agent = GW::Agents::GetAgentByID(cooldown.agent_id);
+        const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
+        if (notification_enabled[static_cast<size_t>(NotificationType::CooldownReady)]
+            && living && living->GetIsAlive() && living->allegiance == GW::Constants::Allegiance::Enemy) {
+            ready_cooldown_skill_ids.push_back(cooldown.skill_id);
+        }
+        return true;
     });
     std::erase_if(tracked_cooldowns, [this, generation](const TrackedCooldown& cooldown) {
         if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
@@ -508,10 +1389,15 @@ void SlopAuras::TrackEnemyCooldown(const uint32_t agent_id, const uint32_t skill
     else {
         tracked_cooldowns.push_back({skill_id, agent_id, now, duration_ms});
     }
+    lock.unlock();
+    for (const auto ready_skill_id : ready_cooldown_skill_ids) {
+        PlayNotification(NotificationType::CooldownReady, ready_skill_id);
+    }
 }
 
-void SlopAuras::Draw(IDirect3DDevice9*)
+void SlopAuras::Draw(IDirect3DDevice9* pDevice)
 {
+    DrawEnemyNameplates(pDevice);
     const auto generation = map_generation.load(std::memory_order_acquire);
     const auto map_is_current = [this, generation] {
         return generation == map_generation.load(std::memory_order_acquire) && IsMapReady();
@@ -544,20 +1430,6 @@ void SlopAuras::Draw(IDirect3DDevice9*)
         std::vector<TrackedCooldown> tracked_cooldowns_snapshot;
         {
             std::lock_guard lock(tracking_mutex);
-            std::erase_if(tracked_casts, [this, generation, now](const TrackedCast& cast) {
-                if (now - cast.timestamp >= cast.duration_ms) {
-                    return true;
-                }
-                if (now - cast.timestamp < 1500) {
-                    return false;
-                }
-                if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
-                    return true;
-                }
-                const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast.skill_id));
-                return skill && skill->type != GW::Constants::SkillType::Ritual
-                    && !IsAgentEffectActive(cast.target_agent_id, cast.skill_id, skill->type);
-            });
             tracked_skill_ids = effect_ids;
             cast_by_me_snapshot = cast_by_me_entries;
             cooldown_ids_snapshot = cooldown_ids;
@@ -619,9 +1491,13 @@ void SlopAuras::Draw(IDirect3DDevice9*)
                     break;
                 }
                 if (static_cast<int>(cast.skill_id) == skill_id) {
-                    const auto remaining = cast.duration_ms - (now - cast.timestamp);
+                    const auto elapsed = now - cast.timestamp;
+                    const auto predicted_remaining = elapsed < cast.duration_ms
+                        ? cast.duration_ms - elapsed
+                        : 0;
+                    const auto remaining = std::max(predicted_remaining, cast.observed_remaining_ms);
                     if (remaining > 0) {
-                        add_active_effect(skill_id, cast.target_agent_id, remaining);
+                        add_active_effect(skill_id, cast.multi_ally ? 0 : cast.target_agent_id, remaining);
                     }
                 }
             }
@@ -634,9 +1510,11 @@ void SlopAuras::Draw(IDirect3DDevice9*)
             if (!map_is_current()) {
                 break;
             }
-            const auto target_name = effect.target_agent_id == GW::Agents::GetControlledCharacterId()
-                ? "you"
-                : GetAgentName(effect.target_agent_id);
+            const auto target_name = effect.target_agent_id == 0
+                ? std::string("allies")
+                : effect.target_agent_id == GW::Agents::GetControlledCharacterId()
+                    ? std::string("you")
+                    : GetAgentName(effect.target_agent_id);
             const auto icon = GetSkillImage(static_cast<GW::Constants::SkillID>(effect.skill_id));
             if (icon && *icon) {
                 ImGui::Image((ImTextureID)(intptr_t)*icon, ImVec2(effect_icon_size, effect_icon_size));
@@ -716,88 +1594,235 @@ void SlopAuras::DrawSettingsWindow()
     }
     settings_changed |= ImGui::SliderFloat("Effect icon size", &effect_icon_size, 12.f, 64.f, "%.0f px");
     settings_changed |= ImGui::SliderFloat("Cooldown icon size", &cooldown_icon_size, 12.f, 64.f, "%.0f px");
+    ImGui::Separator();
+    ImGui::TextUnformatted("Enemy nameplates");
+    settings_changed |= ImGui::Checkbox("Show enemy nameplate overlays", &enemy_nameplates_enabled);
+    settings_changed |= ImGui::Checkbox("Show knockdown and timer", &nameplate_show_knockdown);
+    settings_changed |= ImGui::Checkbox("Show tracked player effects", &nameplate_show_effects);
+    settings_changed |= ImGui::Checkbox("Show tracked enemy cooldowns", &nameplate_show_cooldowns);
+    ImGui::TextWrapped("Only tracked effects and cooldowns are shown. Hexes and conditions use their icons and estimated remaining timers.");
     if (settings_changed) {
+        SaveSettings(nullptr);
+    }
+
+    std::array<bool, static_cast<size_t>(NotificationType::Count)> notification_enabled_snapshot;
+    std::array<std::string, static_cast<size_t>(NotificationType::Count)> notification_sound_paths_snapshot;
+    float notification_lead_seconds_snapshot = 3.f;
+    {
+        std::lock_guard settings_lock(tracking_mutex);
+        notification_enabled_snapshot = notification_enabled;
+        notification_sound_paths_snapshot = notification_sound_paths;
+        notification_lead_seconds_snapshot = notification_lead_seconds;
+    }
+
+    bool notification_settings_changed = false;
+    ImGui::Separator();
+    ImGui::TextUnformatted("Sound notifications");
+    ImGui::TextUnformatted("WAV audio plays through Windows independently of Guild Wars volume and mute.");
+    const auto draw_notification_option = [&notification_enabled_snapshot, &notification_sound_paths_snapshot, &notification_settings_changed](
+        const NotificationType type, const char* label) {
+        const auto index = static_cast<size_t>(type);
+        ImGui::PushID(label);
+        notification_settings_changed |= ImGui::Checkbox(label, &notification_enabled_snapshot[index]);
+        ImGui::TextWrapped("WAV: %s", notification_sound_paths_snapshot[index].empty()
+            ? "(not selected)"
+            : notification_sound_paths_snapshot[index].c_str());
+        if (ImGui::Button("Choose WAV...")) {
+            std::string selected_path;
+            if (BrowseForWaveFile(selected_path)) {
+                notification_sound_paths_snapshot[index] = std::move(selected_path);
+                notification_settings_changed = true;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear WAV") && !notification_sound_paths_snapshot[index].empty()) {
+            notification_sound_paths_snapshot[index].clear();
+            notification_settings_changed = true;
+        }
+        if (notification_enabled_snapshot[index] && notification_sound_paths_snapshot[index].empty()) {
+            ImGui::TextColored(ImVec4(1.f, 0.65f, 0.2f, 1.f), "Choose a WAV file to enable this notification.");
+        }
+        ImGui::Spacing();
+        ImGui::PopID();
+    };
+    draw_notification_option(NotificationType::EffectApplied, "Play when a tracked effect is applied");
+    draw_notification_option(NotificationType::EffectExpiring, "Play when a tracked effect is about to expire");
+    if (notification_enabled_snapshot[static_cast<size_t>(NotificationType::EffectExpiring)]) {
+        notification_settings_changed |= ImGui::SliderFloat("Expiration lead time", &notification_lead_seconds_snapshot, 0.5f, 30.f, "%.1f s");
+    }
+    draw_notification_option(NotificationType::CooldownReady, "Play when a tracked enemy cooldown ends");
+    ImGui::Text("Sound notifications are currently %s. Use /sa mute or /sa unmute to change this.",
+        notifications_muted.load(std::memory_order_acquire) ? "muted" : "unmuted");
+    if (notification_settings_changed) {
+        notification_lead_seconds_snapshot = std::clamp(notification_lead_seconds_snapshot, 0.5f, 30.f);
+        {
+            std::lock_guard settings_lock(tracking_mutex);
+            notification_enabled = notification_enabled_snapshot;
+            notification_sound_paths = std::move(notification_sound_paths_snapshot);
+            notification_lead_seconds = notification_lead_seconds_snapshot;
+        }
         SaveSettings(nullptr);
     }
 
     ImGui::TextUnformatted("Track player effects by skill ID:");
     int input_id = 0;
     std::unique_lock lock(tracking_mutex);
-    for (size_t entry_index = 0; entry_index < effect_ids.size(); ++entry_index) {
-        auto it = effect_ids.begin() + entry_index;
-        ImGui::PushID(input_id++);
-        const auto name = IsMapReady() ? GetSkillName(*it) : std::string("Unknown skill");
-        ImGui::TextUnformatted(name.c_str());
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(100.f);
-        settings_changed |= ImGui::InputInt("Effect skill ID", &*it, 0);
-        const int previous_id = *it;
-        *it = std::max(0, *it);
-        settings_changed |= *it != previous_id;
-        const auto* skill = IsMapReady()
-            && *it > 0 && static_cast<uint32_t>(*it) < GW::SkillbarMgr::GetSkillCount()
-            ? GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(*it))
-            : nullptr;
-        if (skill && IsTrackedCastType(skill->type)) {
-            bool cast_by_me = std::ranges::find(cast_by_me_entries, static_cast<int>(entry_index)) != cast_by_me_entries.end();
-            ImGui::SameLine();
-            if (ImGui::Checkbox("Cast by me", &cast_by_me)) {
-                if (cast_by_me) {
-                    if (std::ranges::find(cast_by_me_entries, static_cast<int>(entry_index)) == cast_by_me_entries.end()) {
-                        cast_by_me_entries.push_back(static_cast<int>(entry_index));
-                    }
-                }
-                else {
-                    std::erase(cast_by_me_entries, static_cast<int>(entry_index));
-                }
-                settings_changed = true;
-            }
+    const auto draw_wav_override_button = [](const char* button_label, std::string& override_path, const std::string& group_default_path) {
+        const auto has_override = !override_path.empty();
+        ImGui::SmallButton(has_override ? "Custom" : "Default");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", has_override ? override_path.c_str()
+                : group_default_path.empty() ? "No sound selected (default)" : group_default_path.c_str());
         }
         ImGui::SameLine();
-        if (ImGui::Button("Remove")) {
-            effect_ids.erase(it);
-            std::erase_if(cast_by_me_entries, [entry_index](const int index) {
-                return index == static_cast<int>(entry_index);
-            });
-            for (auto& index : cast_by_me_entries) {
-                if (index > static_cast<int>(entry_index)) {
-                    --index;
-                }
+        bool changed = false;
+        ImGui::PushID(button_label);
+        if (ImGui::SmallButton("Choose...")) {
+            std::string selected_path;
+            if (BrowseForWaveFile(selected_path)) {
+                override_path = std::move(selected_path);
+                changed = true;
             }
-            settings_changed = true;
-            ImGui::PopID();
-            break;
+        }
+        if (has_override) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Clear")) {
+                override_path.clear();
+                changed = true;
+            }
         }
         ImGui::PopID();
+        return changed;
+    };
+
+    if (ImGui::BeginTable("effect_ids_table", 6,
+        ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+        ImGui::TableSetupColumn("Skill", ImGuiTableColumnFlags_WidthStretch, 0.28f);
+        ImGui::TableSetupColumn("Skill ID", ImGuiTableColumnFlags_WidthFixed, 90.f);
+        ImGui::TableSetupColumn("Cast by me", ImGuiTableColumnFlags_WidthFixed, 90.f);
+        ImGui::TableSetupColumn("Applied sound", ImGuiTableColumnFlags_WidthStretch, 0.18f);
+        ImGui::TableSetupColumn("Expiring sound", ImGuiTableColumnFlags_WidthStretch, 0.18f);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70.f);
+        ImGui::TableHeadersRow();
+
+        for (size_t entry_index = 0; entry_index < effect_ids.size(); ++entry_index) {
+            auto it = effect_ids.begin() + entry_index;
+            ImGui::TableNextRow();
+            ImGui::PushID(input_id++);
+
+            ImGui::TableNextColumn();
+            const auto name = IsMapReady() ? GetSkillName(*it) : std::string("Unknown skill");
+            ImGui::TextUnformatted(name.c_str());
+
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            settings_changed |= ImGui::InputInt("##effect_id", &*it, 0);
+            const int previous_id = *it;
+            *it = std::max(0, *it);
+            settings_changed |= *it != previous_id;
+
+            const auto* skill = IsMapReady()
+                && *it > 0 && static_cast<uint32_t>(*it) < GW::SkillbarMgr::GetSkillCount()
+                ? GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(*it))
+                : nullptr;
+
+            ImGui::TableNextColumn();
+            if (IsTrackedCastType(skill)) {
+                bool cast_by_me = std::ranges::find(cast_by_me_entries, static_cast<int>(entry_index)) != cast_by_me_entries.end();
+                if (ImGui::Checkbox("##cast_by_me", &cast_by_me)) {
+                    if (cast_by_me) {
+                        if (std::ranges::find(cast_by_me_entries, static_cast<int>(entry_index)) == cast_by_me_entries.end()) {
+                            cast_by_me_entries.push_back(static_cast<int>(entry_index));
+                        }
+                    }
+                    else {
+                        std::erase(cast_by_me_entries, static_cast<int>(entry_index));
+                    }
+                    settings_changed = true;
+                }
+            }
+
+            ImGui::TableNextColumn();
+            settings_changed |= draw_wav_override_button("applied_wav", effect_applied_sound_overrides[entry_index],
+                notification_sound_paths[static_cast<size_t>(NotificationType::EffectApplied)]);
+
+            ImGui::TableNextColumn();
+            settings_changed |= draw_wav_override_button("expiring_wav", effect_expiring_sound_overrides[entry_index],
+                notification_sound_paths[static_cast<size_t>(NotificationType::EffectExpiring)]);
+
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("Remove")) {
+                effect_ids.erase(it);
+                effect_applied_sound_overrides.erase(effect_applied_sound_overrides.begin() + entry_index);
+                effect_expiring_sound_overrides.erase(effect_expiring_sound_overrides.begin() + entry_index);
+                std::erase_if(cast_by_me_entries, [entry_index](const int index) {
+                    return index == static_cast<int>(entry_index);
+                });
+                for (auto& index : cast_by_me_entries) {
+                    if (index > static_cast<int>(entry_index)) {
+                        --index;
+                    }
+                }
+                settings_changed = true;
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
     }
 
     if (ImGui::Button("Add effect ID")) {
         effect_ids.emplace_back(0);
+        effect_applied_sound_overrides.emplace_back();
+        effect_expiring_sound_overrides.emplace_back();
         settings_changed = true;
     }
     ImGui::Separator();
     ImGui::TextUnformatted("Track enemy skill cooldowns by skill ID:");
-    for (auto it = cooldown_ids.begin(); it != cooldown_ids.end(); ++it) {
-        ImGui::PushID(input_id++);
-        const auto name = IsMapReady() ? GetSkillName(*it) : std::string("Unknown skill");
-        ImGui::TextUnformatted(name.c_str());
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(100.f);
-        settings_changed |= ImGui::InputInt("Cooldown skill ID", &*it, 0);
-        const int previous_id = *it;
-        *it = std::max(0, *it);
-        settings_changed |= *it != previous_id;
-        ImGui::SameLine();
-        if (ImGui::Button("Remove cooldown")) {
-            cooldown_ids.erase(it);
-            settings_changed = true;
+    if (ImGui::BeginTable("cooldown_ids_table", 4,
+        ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+        ImGui::TableSetupColumn("Skill", ImGuiTableColumnFlags_WidthStretch, 0.4f);
+        ImGui::TableSetupColumn("Skill ID", ImGuiTableColumnFlags_WidthFixed, 90.f);
+        ImGui::TableSetupColumn("Ready sound", ImGuiTableColumnFlags_WidthStretch, 0.3f);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70.f);
+        ImGui::TableHeadersRow();
+
+        for (size_t entry_index = 0; entry_index < cooldown_ids.size(); ++entry_index) {
+            auto it = cooldown_ids.begin() + entry_index;
+            ImGui::TableNextRow();
+            ImGui::PushID(input_id++);
+
+            ImGui::TableNextColumn();
+            const auto name = IsMapReady() ? GetSkillName(*it) : std::string("Unknown skill");
+            ImGui::TextUnformatted(name.c_str());
+
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            settings_changed |= ImGui::InputInt("##cooldown_id", &*it, 0);
+            const int previous_id = *it;
+            *it = std::max(0, *it);
+            settings_changed |= *it != previous_id;
+
+            ImGui::TableNextColumn();
+            settings_changed |= draw_wav_override_button("cooldown_wav", cooldown_sound_overrides[entry_index],
+                notification_sound_paths[static_cast<size_t>(NotificationType::CooldownReady)]);
+
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("Remove")) {
+                cooldown_ids.erase(it);
+                cooldown_sound_overrides.erase(cooldown_sound_overrides.begin() + entry_index);
+                settings_changed = true;
+                ImGui::PopID();
+                break;
+            }
             ImGui::PopID();
-            break;
         }
-        ImGui::PopID();
+        ImGui::EndTable();
     }
     if (ImGui::Button("Add cooldown skill ID")) {
         cooldown_ids.emplace_back(0);
+        cooldown_sound_overrides.emplace_back();
         settings_changed = true;
     }
     ImGui::Separator();
@@ -830,6 +1855,9 @@ void SlopAuras::DrawSettingsWindow()
         std::erase_if(cast_by_me_entries, [this](const int index) {
             return index < 0 || static_cast<size_t>(index) >= effect_ids.size();
         });
+        effect_applied_sound_overrides.resize(effect_ids.size());
+        effect_expiring_sound_overrides.resize(effect_ids.size());
+        cooldown_sound_overrides.resize(cooldown_ids.size());
         std::erase_if(tracked_casts, [this](const TrackedCast& cast) {
             return std::ranges::none_of(cast_by_me_entries, [this, &cast](const int index) {
                 return index >= 0 && static_cast<size_t>(index) < effect_ids.size()
@@ -874,39 +1902,37 @@ std::filesystem::path SlopAuras::GetSettingFile(const wchar_t*) const
 
 void SlopAuras::LoadSettings(const wchar_t* folder)
 {
-    if (GetSettingFile(folder).empty()) {
+    const auto setting_file = GetSettingFile(folder);
+    if (setting_file.empty()) {
         return;
     }
+    // Absence of the settings file means this is the first time the plugin has ever been loaded.
+    pending_welcome_message = !std::filesystem::exists(setting_file);
     ToolboxUIPlugin::LoadSettings(folder);
-    std::vector<int> legacy_cast_by_me_ids;
     {
         std::lock_guard lock(tracking_mutex);
         LoadSetting("effect_ids", effect_ids);
         LoadSetting("cast_by_me_entries", cast_by_me_entries);
-        LoadSetting("cast_by_me_ids", legacy_cast_by_me_ids);
         LoadSetting("cooldown_ids", cooldown_ids);
         LoadSetting("natural_resistance_agent_names", natural_resistance_agent_names);
+        LoadSetting("effect_applied_sound_overrides", effect_applied_sound_overrides);
+        LoadSetting("effect_expiring_sound_overrides", effect_expiring_sound_overrides);
+        LoadSetting("cooldown_sound_overrides", cooldown_sound_overrides);
         LoadSetting("widget_mode", widget_mode);
         LoadSetting("effect_icon_size", effect_icon_size);
         LoadSetting("cooldown_icon_size", cooldown_icon_size);
+        LoadSetting("enemy_nameplates_enabled", enemy_nameplates_enabled);
+        LoadSetting("nameplate_show_knockdown", nameplate_show_knockdown);
+        LoadSetting("nameplate_show_effects", nameplate_show_effects);
+        LoadSetting("nameplate_show_cooldowns", nameplate_show_cooldowns);
+        LoadSetting("notification_enabled", notification_enabled);
+        LoadSetting("notification_sound_paths", notification_sound_paths);
+        LoadSetting("notification_lead_seconds", notification_lead_seconds);
     }
-    bool migrated_legacy_settings = false;
     {
         std::lock_guard lock(tracking_mutex);
         for (auto& skill_id : effect_ids) {
             skill_id = std::max(0, skill_id);
-        }
-        if (cast_by_me_entries.empty()) {
-            for (const auto skill_id : legacy_cast_by_me_ids) {
-                const auto entry = std::ranges::find(effect_ids, skill_id);
-                if (entry != effect_ids.end()) {
-                    const auto entry_index = static_cast<int>(std::distance(effect_ids.begin(), entry));
-                    if (std::ranges::find(cast_by_me_entries, entry_index) == cast_by_me_entries.end()) {
-                        cast_by_me_entries.push_back(entry_index);
-                    }
-                }
-            }
-            migrated_legacy_settings = !legacy_cast_by_me_ids.empty();
         }
         std::erase_if(cast_by_me_entries, [this](const int index) {
             return index < 0 || static_cast<size_t>(index) >= effect_ids.size();
@@ -914,11 +1940,15 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         for (auto& skill_id : cooldown_ids) {
             skill_id = std::max(0, skill_id);
         }
+        effect_applied_sound_overrides.resize(effect_ids.size());
+        effect_expiring_sound_overrides.resize(effect_ids.size());
+        cooldown_sound_overrides.resize(cooldown_ids.size());
         effect_icon_size = std::clamp(effect_icon_size, 12.f, 64.f);
         cooldown_icon_size = std::clamp(cooldown_icon_size, 12.f, 64.f);
-    }
-    if (migrated_legacy_settings) {
-        SaveSettings(folder);
+        notification_lead_seconds = std::clamp(notification_lead_seconds, 0.5f, 30.f);
+        player_effect_ids_snapshot = effect_ids;
+        player_cast_by_me_snapshot = cast_by_me_entries;
+        player_effect_snapshot_initialized = false;
     }
 }
 
@@ -931,12 +1961,21 @@ void SlopAuras::SaveSettings(const wchar_t* folder)
         std::lock_guard lock(tracking_mutex);
         SaveSetting("effect_ids", effect_ids);
         SaveSetting("cast_by_me_entries", cast_by_me_entries);
-        SaveSetting("cast_by_me_ids", std::vector<int>{});
         SaveSetting("cooldown_ids", cooldown_ids);
         SaveSetting("natural_resistance_agent_names", natural_resistance_agent_names);
+        SaveSetting("effect_applied_sound_overrides", effect_applied_sound_overrides);
+        SaveSetting("effect_expiring_sound_overrides", effect_expiring_sound_overrides);
+        SaveSetting("cooldown_sound_overrides", cooldown_sound_overrides);
         SaveSetting("widget_mode", widget_mode);
         SaveSetting("effect_icon_size", effect_icon_size);
         SaveSetting("cooldown_icon_size", cooldown_icon_size);
+        SaveSetting("enemy_nameplates_enabled", enemy_nameplates_enabled);
+        SaveSetting("nameplate_show_knockdown", nameplate_show_knockdown);
+        SaveSetting("nameplate_show_effects", nameplate_show_effects);
+        SaveSetting("nameplate_show_cooldowns", nameplate_show_cooldowns);
+        SaveSetting("notification_enabled", notification_enabled);
+        SaveSetting("notification_sound_paths", notification_sound_paths);
+        SaveSetting("notification_lead_seconds", notification_lead_seconds);
     }
     ToolboxUIPlugin::SaveSettings(folder);
 }
