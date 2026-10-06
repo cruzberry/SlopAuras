@@ -3,6 +3,8 @@
 #include <PluginUtils.h>
 
 #include <Windows.h>
+#include <commdlg.h>
+#include <mmsystem.h>
 
 #include <cctype>
 #include <iomanip>
@@ -24,6 +26,9 @@
 #include <GWCA/Managers/PlayerMgr.h>
 #include <GWCA/Managers/SkillbarMgr.h>
 #include <GWCA/Managers/UIMgr.h>
+
+#pragma comment(lib, "Comdlg32.lib")
+#pragma comment(lib, "Winmm.lib")
 
 extern "C" __declspec(dllimport) IDirect3DTexture9** __cdecl GetSkillImage(GW::Constants::SkillID skill_id);
 
@@ -245,12 +250,47 @@ namespace {
             static_cast<int>(value.size()), result.data(), length);
         return result;
     }
+
+    bool BrowseForWaveFile(std::string& selected_path)
+    {
+        std::array<wchar_t, 32768> path{};
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = GetForegroundWindow();
+        dialog.lpstrFilter = L"Wave audio (*.wav)\0*.wav\0\0";
+        dialog.lpstrFile = path.data();
+        dialog.nMaxFile = static_cast<DWORD>(path.size());
+        dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (!GetOpenFileNameW(&dialog)) {
+            if (CommDlgExtendedError()) {
+                OutputDebugStringW(L"SlopAuras: WAV file picker failed.\n");
+            }
+            return false;
+        }
+        const auto extension = PluginUtils::ToLower(std::filesystem::path(path.data()).extension().wstring());
+        if (extension != L".wav") {
+            return false;
+        }
+        const std::wstring wide_path(path.data());
+        if (wide_path.size() >= 256) {
+            GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2,
+                L"SlopAuras: notification WAV path must be shorter than 256 characters.", L"SlopAuras");
+            return false;
+        }
+        selected_path = PluginUtils::WStringToString(wide_path);
+        return !selected_path.empty();
+    }
 }
 
 DLLAPI ToolboxPlugin* ToolboxPluginInstance()
 {
     static SlopAuras instance;
     return &instance;
+}
+
+SlopAuras::~SlopAuras()
+{
+    StopNotificationWorker();
 }
 
 void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const int argc, const LPWSTR* argv)
@@ -265,6 +305,8 @@ void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const 
         GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa hide - Hide the SlopAuras window.", L"SlopAuras");
         GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa show - Show the SlopAuras window.", L"SlopAuras");
         GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa print - Print tracked effects and enemy cooldowns.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa mute - Mute SlopAuras sound notifications.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa unmute - Unmute SlopAuras sound notifications.", L"SlopAuras");
     };
 
     if (argc != 2 || !argv || !argv[1]) {
@@ -283,9 +325,108 @@ void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const 
     else if (subcommand == L"print") {
         instance->PrintTrackedEffects();
     }
+    else if (subcommand == L"mute") {
+        instance->SetNotificationsMuted(true);
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"SlopAuras: Sound notifications muted.", L"SlopAuras");
+    }
+    else if (subcommand == L"unmute") {
+        instance->SetNotificationsMuted(false);
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"SlopAuras: Sound notifications unmuted.", L"SlopAuras");
+    }
     else {
         print_help();
     }
+}
+
+void SlopAuras::PlayNotification(const NotificationType type)
+{
+    if (notifications_muted.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::string path;
+    {
+        std::lock_guard lock(tracking_mutex);
+        const auto index = static_cast<size_t>(type);
+        if (index >= notification_enabled.size() || !notification_enabled[index]) {
+            return;
+        }
+        path = notification_sound_paths[index];
+    }
+    if (path.empty()) {
+        return;
+    }
+
+    auto wide_path = PluginUtils::StringToWString(path);
+    if (wide_path.empty()) {
+        OutputDebugStringW(L"SlopAuras: selected notification WAV path could not be converted.\n");
+        return;
+    }
+    {
+        std::lock_guard lock(notification_queue_mutex);
+        if (notification_worker_stopping) {
+            return;
+        }
+        if ((notification_playing && notification_playing_type == type)
+            || std::ranges::any_of(notification_queue, [type](const QueuedNotification& queued) {
+                return queued.type == type;
+            })) {
+            return;
+        }
+        notification_queue.push_back({type, std::move(wide_path)});
+    }
+    notification_condition.notify_one();
+}
+
+void SlopAuras::NotificationWorker()
+{
+    std::unique_lock lock(notification_queue_mutex);
+    for (;;) {
+        notification_condition.wait(lock, [this] {
+            return notification_worker_stopping || !notification_queue.empty();
+        });
+        if (notification_worker_stopping && notification_queue.empty()) {
+            return;
+        }
+        auto notification = std::move(notification_queue.front());
+        notification_queue.pop_front();
+        notification_playing = true;
+        notification_playing_type = notification.type;
+        lock.unlock();
+        if (!notifications_muted.load(std::memory_order_acquire)
+            && !PlaySoundW(notification.path.c_str(), nullptr, SND_FILENAME | SND_SYNC | SND_NODEFAULT)) {
+            OutputDebugStringW(L"SlopAuras: failed to play the selected notification WAV file.\n");
+        }
+        lock.lock();
+        notification_playing = false;
+    }
+}
+
+void SlopAuras::StopNotificationWorker()
+{
+    {
+        std::lock_guard lock(notification_queue_mutex);
+        notification_worker_stopping = true;
+        notification_queue.clear();
+    }
+    PlaySoundW(nullptr, nullptr, 0);
+    notification_condition.notify_all();
+    if (notification_worker.joinable()) {
+        notification_worker.join();
+    }
+}
+
+void SlopAuras::SetNotificationsMuted(const bool muted)
+{
+    notifications_muted.store(muted, std::memory_order_release);
+    if (!muted) {
+        return;
+    }
+    {
+        std::lock_guard lock(notification_queue_mutex);
+        notification_queue.clear();
+    }
+    PlaySoundW(nullptr, nullptr, 0);
 }
 
 void SlopAuras::PrintTrackedEffects()
@@ -428,6 +569,11 @@ void SlopAuras::PrintTrackedEffects()
 void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODULE toolbox_dll)
 {
     ToolboxUIPlugin::Initialize(ctx, allocator_fns, toolbox_dll);
+    {
+        std::lock_guard lock(notification_queue_mutex);
+        notification_worker_stopping = false;
+    }
+    notification_worker = std::thread(&SlopAuras::NotificationWorker, this);
     GW::Chat::CreateCommand(&chat_command_hook, L"sa", HandleChatCommand);
     GW::UI::RegisterUIMessageCallback(&map_loading_hook, GW::UI::UIMessage::kLoadMapContext, [this](GW::HookStatus*, GW::UI::UIMessage, void*, void*) {
         map_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -435,6 +581,8 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
         tracked_casts.clear();
         tracked_cooldowns.clear();
         pending_casts.clear();
+        player_effect_notifications.clear();
+        player_effect_snapshot_initialized = false;
     });
     GW::UI::RegisterUIMessageCallback(&skill_started_cast_hook, GW::UI::UIMessage::kAgentSkillStartedCast, [this](GW::HookStatus*, GW::UI::UIMessage, void* wparam, void*) {
         const auto* packet = static_cast<GW::UI::UIPacket::kAgentSkillStartedCast*>(wparam);
@@ -522,6 +670,7 @@ void SlopAuras::SignalTerminate()
 
 void SlopAuras::Terminate()
 {
+    StopNotificationWorker();
     GW::UI::RemoveUIMessageCallback(&skill_activated_hook);
     GW::UI::RemoveUIMessageCallback(&skill_started_cast_hook);
     GW::UI::RemoveUIMessageCallback(&map_loading_hook);
@@ -530,6 +679,8 @@ void SlopAuras::Terminate()
         tracked_casts.clear();
         tracked_cooldowns.clear();
         pending_casts.clear();
+        player_effect_notifications.clear();
+        player_effect_snapshot_initialized = false;
     }
     ToolboxUIPlugin::Terminate();
 }
@@ -554,18 +705,108 @@ void SlopAuras::Update(float delta)
         return;
     }
     const auto now = GW::MemoryMgr::GetSkillTimer();
-    std::lock_guard lock(tracking_mutex);
-    std::erase_if(tracked_cooldowns, [this, generation, now](const TrackedCooldown& cooldown) {
-        if (now - cooldown.timestamp >= cooldown.duration_ms) {
-            return true;
+    std::array<bool, static_cast<size_t>(NotificationType::Count)> pending_notifications{};
+    const auto player_effects = GW::Effects::GetPlayerEffects();
+    {
+        std::lock_guard lock(tracking_mutex);
+        const auto tracked_effects_changed = player_effect_ids_snapshot != effect_ids
+            || player_cast_by_me_snapshot != cast_by_me_entries;
+        player_effect_ids_snapshot = effect_ids;
+        player_cast_by_me_snapshot = cast_by_me_entries;
+
+        if (player_effects) {
+            std::vector<PlayerEffectNotification> current_player_effects;
+            for (const auto& effect : *player_effects) {
+                const auto skill_id = static_cast<uint32_t>(effect.skill_id);
+                if (!effect.duration || !effect.GetTimeRemaining()
+                    || std::ranges::find(effect_ids, static_cast<int>(skill_id)) == effect_ids.end()
+                    || std::ranges::any_of(cast_by_me_entries, [this, skill_id](const int entry) {
+                        return entry >= 0 && static_cast<size_t>(entry) < effect_ids.size()
+                            && effect_ids[entry] == static_cast<int>(skill_id);
+                    })) {
+                    continue;
+                }
+                if (std::ranges::find_if(current_player_effects, [skill_id, &effect](const PlayerEffectNotification& tracked) {
+                    return tracked.skill_id == skill_id && tracked.timestamp == effect.timestamp;
+                }) != current_player_effects.end()) {
+                    continue;
+                }
+                const auto previous = std::ranges::find_if(player_effect_notifications, [skill_id, &effect](const PlayerEffectNotification& tracked) {
+                    return tracked.skill_id == skill_id && tracked.timestamp == effect.timestamp;
+                });
+                const auto is_new = previous == player_effect_notifications.end();
+                current_player_effects.push_back({
+                    skill_id,
+                    effect.timestamp,
+                    !is_new && previous->expiration_notified
+                });
+                if (is_new && player_effect_snapshot_initialized && !tracked_effects_changed
+                    && notification_enabled[static_cast<size_t>(NotificationType::EffectApplied)]) {
+                    pending_notifications[static_cast<size_t>(NotificationType::EffectApplied)] = true;
+                }
+                auto& tracked = current_player_effects.back();
+                const auto remaining = effect.GetTimeRemaining();
+                if (!tracked.expiration_notified
+                    && remaining <= static_cast<DWORD>(notification_lead_seconds * 1000.f)
+                    && notification_enabled[static_cast<size_t>(NotificationType::EffectExpiring)]) {
+                    tracked.expiration_notified = true;
+                    pending_notifications[static_cast<size_t>(NotificationType::EffectExpiring)] = true;
+                }
+            }
+            player_effect_notifications = std::move(current_player_effects);
+            player_effect_snapshot_initialized = true;
         }
-        if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
-            return true;
+
+        for (auto cast = tracked_casts.begin(); cast != tracked_casts.end();) {
+            const auto elapsed = now - cast->timestamp;
+            if (elapsed >= cast->duration_ms) {
+                cast = tracked_casts.erase(cast);
+                continue;
+            }
+            if (elapsed >= 1500) {
+                if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+                    cast = tracked_casts.erase(cast);
+                    continue;
+                }
+                const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast->skill_id));
+                if (skill && (skill->type != GW::Constants::SkillType::Ritual || skill->condition != 0)
+                    && !IsAgentEffectActive(cast->target_agent_id, *skill)) {
+                    cast = tracked_casts.erase(cast);
+                    continue;
+                }
+            }
+            const auto remaining = cast->duration_ms - elapsed;
+            if (!cast->expiration_notified
+                && remaining <= static_cast<uint32_t>(notification_lead_seconds * 1000.f)
+                && notification_enabled[static_cast<size_t>(NotificationType::EffectExpiring)]) {
+                cast->expiration_notified = true;
+                pending_notifications[static_cast<size_t>(NotificationType::EffectExpiring)] = true;
+            }
+            ++cast;
         }
-        const auto* agent = GW::Agents::GetAgentByID(cooldown.agent_id);
-        const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
-        return !living || !living->GetIsAlive() || living->allegiance != GW::Constants::Allegiance::Enemy;
-    });
+        std::erase_if(tracked_cooldowns, [this, generation, now, &pending_notifications](const TrackedCooldown& cooldown) {
+            if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+                return true;
+            }
+            const auto* agent = GW::Agents::GetAgentByID(cooldown.agent_id);
+            const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
+            if (!living || !living->GetIsAlive() || living->allegiance != GW::Constants::Allegiance::Enemy) {
+                return true;
+            }
+            if (now - cooldown.timestamp < cooldown.duration_ms) {
+                return false;
+            }
+            if (notification_enabled[static_cast<size_t>(NotificationType::CooldownReady)]) {
+                pending_notifications[static_cast<size_t>(NotificationType::CooldownReady)] = true;
+            }
+            return true;
+        });
+    }
+    for (size_t index = 0; index < pending_notifications.size(); ++index) {
+        if (pending_notifications[index]) {
+            PlayNotification(static_cast<NotificationType>(index));
+        }
+    }
 }
 
 void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
@@ -605,7 +846,7 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
         || skill->type == GW::Constants::SkillType::Enchantment) && IsEnemyAgent(target_id)
         ? GW::Agents::GetControlledCharacterId()
         : target_id;
-    std::lock_guard lock(tracking_mutex);
+    std::unique_lock lock(tracking_mutex);
     if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
         return;
     }
@@ -645,9 +886,15 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
     if (existing != tracked_casts.end()) {
         existing->timestamp = now;
         existing->duration_ms = duration_ms;
+        existing->expiration_notified = false;
     }
     else {
         tracked_casts.push_back({static_cast<uint32_t>(skill_id), resolved_target_id, now, duration_ms});
+    }
+    const auto notify_applied = notification_enabled[static_cast<size_t>(NotificationType::EffectApplied)];
+    lock.unlock();
+    if (notify_applied) {
+        PlayNotification(NotificationType::EffectApplied);
     }
 }
 
@@ -667,15 +914,23 @@ void SlopAuras::TrackEnemyCooldown(const uint32_t agent_id, const uint32_t skill
 
     const auto now = GW::MemoryMgr::GetSkillTimer();
     const auto duration_ms = skill->recharge * 1000u;
-    std::lock_guard lock(tracking_mutex);
+    std::unique_lock lock(tracking_mutex);
     if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
         return;
     }
     if (std::ranges::find(cooldown_ids, static_cast<int>(skill_id)) == cooldown_ids.end()) {
         return;
     }
-    std::erase_if(tracked_cooldowns, [now](const TrackedCooldown& cooldown) {
-        return now - cooldown.timestamp >= cooldown.duration_ms;
+    bool notify_cooldown_ready = false;
+    std::erase_if(tracked_cooldowns, [this, now, &notify_cooldown_ready](const TrackedCooldown& cooldown) {
+        if (now - cooldown.timestamp < cooldown.duration_ms) {
+            return false;
+        }
+        const auto* agent = GW::Agents::GetAgentByID(cooldown.agent_id);
+        const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
+        notify_cooldown_ready |= notification_enabled[static_cast<size_t>(NotificationType::CooldownReady)]
+            && living && living->GetIsAlive() && living->allegiance == GW::Constants::Allegiance::Enemy;
+        return true;
     });
     std::erase_if(tracked_cooldowns, [this, generation](const TrackedCooldown& cooldown) {
         if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
@@ -694,6 +949,10 @@ void SlopAuras::TrackEnemyCooldown(const uint32_t agent_id, const uint32_t skill
     }
     else {
         tracked_cooldowns.push_back({skill_id, agent_id, now, duration_ms});
+    }
+    lock.unlock();
+    if (notify_cooldown_ready) {
+        PlayNotification(NotificationType::CooldownReady);
     }
 }
 
@@ -731,20 +990,6 @@ void SlopAuras::Draw(IDirect3DDevice9*)
         std::vector<TrackedCooldown> tracked_cooldowns_snapshot;
         {
             std::lock_guard lock(tracking_mutex);
-            std::erase_if(tracked_casts, [this, generation, now](const TrackedCast& cast) {
-                if (now - cast.timestamp >= cast.duration_ms) {
-                    return true;
-                }
-                if (now - cast.timestamp < 1500) {
-                    return false;
-                }
-                if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
-                    return true;
-                }
-                const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast.skill_id));
-                return skill && (skill->type != GW::Constants::SkillType::Ritual || skill->condition != 0)
-                    && !IsAgentEffectActive(cast.target_agent_id, *skill);
-            });
             tracked_skill_ids = effect_ids;
             cast_by_me_snapshot = cast_by_me_entries;
             cooldown_ids_snapshot = cooldown_ids;
@@ -904,6 +1149,65 @@ void SlopAuras::DrawSettingsWindow()
     settings_changed |= ImGui::SliderFloat("Effect icon size", &effect_icon_size, 12.f, 64.f, "%.0f px");
     settings_changed |= ImGui::SliderFloat("Cooldown icon size", &cooldown_icon_size, 12.f, 64.f, "%.0f px");
     if (settings_changed) {
+        SaveSettings(nullptr);
+    }
+
+    std::array<bool, static_cast<size_t>(NotificationType::Count)> notification_enabled_snapshot;
+    std::array<std::string, static_cast<size_t>(NotificationType::Count)> notification_sound_paths_snapshot;
+    float notification_lead_seconds_snapshot = 3.f;
+    {
+        std::lock_guard settings_lock(tracking_mutex);
+        notification_enabled_snapshot = notification_enabled;
+        notification_sound_paths_snapshot = notification_sound_paths;
+        notification_lead_seconds_snapshot = notification_lead_seconds;
+    }
+
+    bool notification_settings_changed = false;
+    ImGui::Separator();
+    ImGui::TextUnformatted("Sound notifications");
+    ImGui::TextUnformatted("WAV audio plays through Windows independently of Guild Wars volume and mute.");
+    const auto draw_notification_option = [&notification_enabled_snapshot, &notification_sound_paths_snapshot, &notification_settings_changed](
+        const NotificationType type, const char* label) {
+        const auto index = static_cast<size_t>(type);
+        ImGui::PushID(label);
+        notification_settings_changed |= ImGui::Checkbox(label, &notification_enabled_snapshot[index]);
+        ImGui::TextWrapped("WAV: %s", notification_sound_paths_snapshot[index].empty()
+            ? "(not selected)"
+            : notification_sound_paths_snapshot[index].c_str());
+        if (ImGui::Button("Choose WAV...")) {
+            std::string selected_path;
+            if (BrowseForWaveFile(selected_path)) {
+                notification_sound_paths_snapshot[index] = std::move(selected_path);
+                notification_settings_changed = true;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear WAV") && !notification_sound_paths_snapshot[index].empty()) {
+            notification_sound_paths_snapshot[index].clear();
+            notification_settings_changed = true;
+        }
+        if (notification_enabled_snapshot[index] && notification_sound_paths_snapshot[index].empty()) {
+            ImGui::TextColored(ImVec4(1.f, 0.65f, 0.2f, 1.f), "Choose a WAV file to enable this notification.");
+        }
+        ImGui::Spacing();
+        ImGui::PopID();
+    };
+    draw_notification_option(NotificationType::EffectApplied, "Play when a tracked effect is applied");
+    draw_notification_option(NotificationType::EffectExpiring, "Play when a tracked effect is about to expire");
+    if (notification_enabled_snapshot[static_cast<size_t>(NotificationType::EffectExpiring)]) {
+        notification_settings_changed |= ImGui::SliderFloat("Expiration lead time", &notification_lead_seconds_snapshot, 0.5f, 30.f, "%.1f s");
+    }
+    draw_notification_option(NotificationType::CooldownReady, "Play when a tracked enemy cooldown ends");
+    ImGui::Text("Sound notifications are currently %s. Use /sa mute or /sa unmute to change this.",
+        notifications_muted.load(std::memory_order_acquire) ? "muted" : "unmuted");
+    if (notification_settings_changed) {
+        notification_lead_seconds_snapshot = std::clamp(notification_lead_seconds_snapshot, 0.5f, 30.f);
+        {
+            std::lock_guard settings_lock(tracking_mutex);
+            notification_enabled = notification_enabled_snapshot;
+            notification_sound_paths = std::move(notification_sound_paths_snapshot);
+            notification_lead_seconds = notification_lead_seconds_snapshot;
+        }
         SaveSettings(nullptr);
     }
 
@@ -1076,6 +1380,9 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         LoadSetting("widget_mode", widget_mode);
         LoadSetting("effect_icon_size", effect_icon_size);
         LoadSetting("cooldown_icon_size", cooldown_icon_size);
+        LoadSetting("notification_enabled", notification_enabled);
+        LoadSetting("notification_sound_paths", notification_sound_paths);
+        LoadSetting("notification_lead_seconds", notification_lead_seconds);
     }
     bool migrated_legacy_settings = false;
     {
@@ -1103,6 +1410,10 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         }
         effect_icon_size = std::clamp(effect_icon_size, 12.f, 64.f);
         cooldown_icon_size = std::clamp(cooldown_icon_size, 12.f, 64.f);
+        notification_lead_seconds = std::clamp(notification_lead_seconds, 0.5f, 30.f);
+        player_effect_ids_snapshot = effect_ids;
+        player_cast_by_me_snapshot = cast_by_me_entries;
+        player_effect_snapshot_initialized = false;
     }
     if (migrated_legacy_settings) {
         SaveSettings(folder);
@@ -1124,6 +1435,9 @@ void SlopAuras::SaveSettings(const wchar_t* folder)
         SaveSetting("widget_mode", widget_mode);
         SaveSetting("effect_icon_size", effect_icon_size);
         SaveSetting("cooldown_icon_size", cooldown_icon_size);
+        SaveSetting("notification_enabled", notification_enabled);
+        SaveSetting("notification_sound_paths", notification_sound_paths);
+        SaveSetting("notification_lead_seconds", notification_lead_seconds);
     }
     ToolboxUIPlugin::SaveSettings(folder);
 }
