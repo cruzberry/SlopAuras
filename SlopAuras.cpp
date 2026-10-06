@@ -9,9 +9,11 @@
 #include <sstream>
 
 #include <GWCA/Constants/Constants.h>
+#include <GWCA/Context/WorldContext.h>
 #include <GWCA/GameEntities/Agent.h>
 #include <GWCA/GameEntities/Attribute.h>
 #include <GWCA/GameEntities/Skill.h>
+#include <GWCA/GameEntities/Title.h>
 #include <GWCA/Managers/AgentMgr.h>
 #include <GWCA/Managers/EffectMgr.h>
 #include <GWCA/Managers/GameThreadMgr.h>
@@ -19,6 +21,7 @@
 #include <GWCA/Managers/MapMgr.h>
 #include <GWCA/Managers/MemoryMgr.h>
 #include <GWCA/Managers/PartyMgr.h>
+#include <GWCA/Managers/PlayerMgr.h>
 #include <GWCA/Managers/SkillbarMgr.h>
 #include <GWCA/Managers/UIMgr.h>
 
@@ -53,13 +56,14 @@ namespace {
         return living && living->allegiance == GW::Constants::Allegiance::Enemy;
     }
 
-    bool IsTrackedCastType(const GW::Constants::SkillType type)
+    bool IsTrackedCastType(const GW::Skill* skill)
     {
-        return type == GW::Constants::SkillType::Hex
-            || type == GW::Constants::SkillType::Enchantment
-            || type == GW::Constants::SkillType::WeaponSpell
-            || type == GW::Constants::SkillType::Shout
-            || type == GW::Constants::SkillType::Ritual;
+        return skill && (skill->type == GW::Constants::SkillType::Hex
+            || skill->type == GW::Constants::SkillType::Enchantment
+            || skill->type == GW::Constants::SkillType::WeaponSpell
+            || skill->type == GW::Constants::SkillType::Shout
+            || skill->type == GW::Constants::SkillType::Ritual
+            || skill->condition != 0);
     }
 
     uint32_t GetAttributeLevel(const GW::Constants::AttributeByte attribute)
@@ -67,6 +71,34 @@ namespace {
         const auto* attributes = GW::PartyMgr::GetAgentAttributes(GW::Agents::GetControlledCharacterId());
         const auto attribute_id = static_cast<uint32_t>(attribute);
         return attributes && attribute_id < 54 ? attributes[attribute_id].level : 0;
+    }
+
+    float GetSkillDuration(const GW::Skill& skill)
+    {
+        const auto duration0 = static_cast<float>(skill.duration0);
+        const auto duration_delta = static_cast<float>(skill.duration15) - duration0;
+        if (skill.title != 0) {
+            const auto* title = GW::PlayerMgr::GetTitleTrack(static_cast<GW::Constants::TitleID>(skill.title));
+            const auto* world = GW::GetWorldContext();
+            if (!title || !world || !title->max_title_rank
+                || title->current_title_tier_index >= world->title_tiers.size()) {
+                return duration0;
+            }
+            // Vampirism's duration stops scaling at Sunspear rank 5.
+            const auto max_effective_rank = skill.skill_id == GW::Constants::SkillID::Vampirism
+                ? std::min(title->max_title_rank, 5u)
+                : title->max_title_rank;
+            const auto rank = std::min(world->title_tiers[title->current_title_tier_index].tier_number, max_effective_rank);
+            return duration0 + duration_delta * static_cast<float>(rank) / static_cast<float>(max_effective_rank);
+        }
+
+        if (skill.attribute == GW::Constants::AttributeByte::None) {
+            return duration0;
+        }
+        const auto attribute_level = GetAttributeLevel(skill.attribute);
+        return attribute_level > 0
+            ? duration0 + duration_delta * static_cast<float>(attribute_level) / 15.f
+            : duration0;
     }
 
     float GetEnchantingWeaponBonus()
@@ -87,22 +119,26 @@ namespace {
         return 0.f;
     }
 
-    bool IsAgentEffectActive(const uint32_t agent_id, const uint32_t skill_id, const GW::Constants::SkillType type)
+    bool IsAgentEffectActive(const uint32_t agent_id, const GW::Skill& skill)
     {
         const auto* agent = GW::Agents::GetAgentByID(agent_id);
         const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
         if (!living || !living->GetIsAlive()) {
             return false;
         }
+        if (skill.type == GW::Constants::SkillType::Hex) {
+            return living->GetIsHexed();
+        }
+        if (skill.condition != 0) {
+            return living->GetIsConditioned();
+        }
         const auto* effects = GW::Effects::GetAgentEffects(agent_id);
         if (effects) {
-            return std::ranges::any_of(*effects, [skill_id](const GW::Effect& effect) {
-                return static_cast<uint32_t>(effect.skill_id) == skill_id && effect.GetTimeRemaining() > 0;
+            return std::ranges::any_of(*effects, [&skill](const GW::Effect& effect) {
+                return effect.skill_id == skill.skill_id && effect.GetTimeRemaining() > 0;
             });
         }
-        switch (type) {
-        case GW::Constants::SkillType::Hex:
-            return living->GetIsHexed();
+        switch (skill.type) {
         case GW::Constants::SkillType::Enchantment:
             return living->GetIsEnchanted();
         case GW::Constants::SkillType::WeaponSpell:
@@ -327,8 +363,8 @@ void SlopAuras::PrintTrackedEffects()
             }
             if (elapsed >= 1500) {
                 const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast.skill_id));
-                if (skill && skill->type != GW::Constants::SkillType::Ritual
-                    && !IsAgentEffectActive(cast.target_agent_id, cast.skill_id, skill->type)) {
+                if (skill && (skill->type != GW::Constants::SkillType::Ritual || skill->condition != 0)
+                    && !IsAgentEffectActive(cast.target_agent_id, *skill)) {
                     continue;
                 }
             }
@@ -412,7 +448,7 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
             return;
         }
         const auto* skill = GW::SkillbarMgr::GetSkillConstantData(packet->skill_id);
-        if (!skill || !IsTrackedCastType(skill->type)) {
+        if (!IsTrackedCastType(skill)) {
             return;
         }
         const auto now = GW::MemoryMgr::GetSkillTimer();
@@ -541,20 +577,12 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
     }
 
     const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(skill_id));
-    if (!skill || !IsTrackedCastType(skill->type) || skill->duration0 == 0
+    if (!IsTrackedCastType(skill) || skill->duration0 == 0
         || skill->duration0 >= 0x20000 || skill->duration15 >= 0x20000) {
         return;
     }
 
-    uint32_t attribute_level = 0;
-    if (skill->attribute != GW::Constants::AttributeByte::None) {
-        attribute_level = GetAttributeLevel(skill->attribute);
-    }
-
-    auto duration = static_cast<float>(skill->duration0);
-    if (attribute_level > 0) {
-        duration += (static_cast<float>(skill->duration15) - static_cast<float>(skill->duration0)) * attribute_level / 15.f;
-    }
+    auto duration = GetSkillDuration(*skill);
     if (skill->type == GW::Constants::SkillType::WeaponSpell) {
         duration *= 1.f + GetAttributeLevel(GW::Constants::AttributeByte::SpawningPower) * 0.04f;
     }
@@ -714,8 +742,8 @@ void SlopAuras::Draw(IDirect3DDevice9*)
                     return true;
                 }
                 const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast.skill_id));
-                return skill && skill->type != GW::Constants::SkillType::Ritual
-                    && !IsAgentEffectActive(cast.target_agent_id, cast.skill_id, skill->type);
+                return skill && (skill->type != GW::Constants::SkillType::Ritual || skill->condition != 0)
+                    && !IsAgentEffectActive(cast.target_agent_id, *skill);
             });
             tracked_skill_ids = effect_ids;
             cast_by_me_snapshot = cast_by_me_entries;
@@ -897,7 +925,7 @@ void SlopAuras::DrawSettingsWindow()
             && *it > 0 && static_cast<uint32_t>(*it) < GW::SkillbarMgr::GetSkillCount()
             ? GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(*it))
             : nullptr;
-        if (skill && IsTrackedCastType(skill->type)) {
+        if (IsTrackedCastType(skill)) {
             bool cast_by_me = std::ranges::find(cast_by_me_entries, static_cast<int>(entry_index)) != cast_by_me_entries.end();
             ImGui::SameLine();
             if (ImGui::Checkbox("Cast by me", &cast_by_me)) {
