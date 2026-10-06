@@ -207,9 +207,9 @@ void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const 
     status->blocked = true;
 
     const auto print_help = [] {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa help - What you just typed!", L"SlopAuras");
         GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa hide - Hide the SlopAuras window.", L"SlopAuras");
         GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa show - Show the SlopAuras window.", L"SlopAuras");
-        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa help - List SlopAuras chat commands.", L"SlopAuras");
     };
 
     if (argc != 2 || !argv || !argv[1]) {
