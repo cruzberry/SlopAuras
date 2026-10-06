@@ -4,6 +4,8 @@
 
 #include <Windows.h>
 
+#include <cctype>
+
 #include <GWCA/Constants/Constants.h>
 #include <GWCA/GameEntities/Agent.h>
 #include <GWCA/GameEntities/Attribute.h>
@@ -28,11 +30,18 @@ namespace {
             && GW::Agents::GetControlledCharacter();
     }
 
-    uint32_t GetAgentModelId(const uint32_t agent_id)
+    std::string NormalizeAgentName(const std::string& name)
     {
-        const auto* agent = GW::Agents::GetAgentByID(agent_id);
-        const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
-        return living ? living->player_number : 0;
+        auto normalized = name;
+        std::ranges::transform(normalized, normalized.begin(), [](const unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
+        const auto first = normalized.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            return {};
+        }
+        const auto last = normalized.find_last_not_of(" \t\r\n");
+        return normalized.substr(first, last - first + 1);
     }
 
     bool IsEnemyAgent(const uint32_t agent_id)
@@ -421,10 +430,12 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
     })) {
         return;
     }
-    const auto target_model_id = GetAgentModelId(resolved_target_id);
+    const auto target_name = NormalizeAgentName(GetAgentName(resolved_target_id));
     if (skill->type == GW::Constants::SkillType::Hex
-        && target_model_id
-        && std::ranges::find(natural_resistance_model_ids, static_cast<int>(target_model_id)) != natural_resistance_model_ids.end()) {
+        && !target_name.empty() && target_name != "loading name..." && target_name != "unknown target"
+        && std::ranges::any_of(natural_resistance_agent_names, [&target_name](const std::string& name) {
+            return NormalizeAgentName(name) == target_name;
+        })) {
         duration_ms = static_cast<uint32_t>(std::floor(duration / 2.f + 0.5f) * 1000.f);
     }
     if (duration_ms == 0) {
@@ -790,26 +801,29 @@ void SlopAuras::DrawSettingsWindow()
         settings_changed = true;
     }
     ImGui::Separator();
-    ImGui::TextUnformatted("Natural Resistance agents (Model IDs):");
-    ImGui::TextUnformatted("Hex duration is halved for casts targeting these agent model IDs, rounded half up to a whole second.");
-    for (auto it = natural_resistance_model_ids.begin(); it != natural_resistance_model_ids.end(); ++it) {
+    ImGui::TextUnformatted("Natural Resistance agents (names):");
+    ImGui::TextUnformatted("Hex duration is halved for casts targeting agents with these names, rounded half up to a whole second.");
+    for (auto it = natural_resistance_agent_names.begin(); it != natural_resistance_agent_names.end(); ++it) {
         ImGui::PushID(input_id++);
-        ImGui::SetNextItemWidth(150.f);
-        settings_changed |= ImGui::InputInt("Agent model ID", &*it, 0);
-        const int previous_id = *it;
-        *it = std::max(0, *it);
-        settings_changed |= *it != previous_id;
+        std::array<char, 128> name_buffer{};
+        const auto name_length = std::min(it->size(), name_buffer.size() - 1);
+        std::copy_n(it->data(), name_length, name_buffer.data());
+        ImGui::SetNextItemWidth(240.f);
+        if (ImGui::InputText("Agent name", name_buffer.data(), name_buffer.size())) {
+            *it = name_buffer.data();
+            settings_changed = true;
+        }
         ImGui::SameLine();
-        if (ImGui::Button("Remove agent")) {
-            natural_resistance_model_ids.erase(it);
+        if (ImGui::Button("Remove agent name")) {
+            natural_resistance_agent_names.erase(it);
             settings_changed = true;
             ImGui::PopID();
             break;
         }
         ImGui::PopID();
     }
-    if (ImGui::Button("Add agent model ID")) {
-        natural_resistance_model_ids.emplace_back(0);
+    if (ImGui::Button("Add agent name")) {
+        natural_resistance_agent_names.emplace_back();
         settings_changed = true;
     }
     if (settings_changed) {
@@ -871,7 +885,7 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         LoadSetting("cast_by_me_entries", cast_by_me_entries);
         LoadSetting("cast_by_me_ids", legacy_cast_by_me_ids);
         LoadSetting("cooldown_ids", cooldown_ids);
-        LoadSetting("natural_resistance_model_ids", natural_resistance_model_ids);
+        LoadSetting("natural_resistance_agent_names", natural_resistance_agent_names);
         LoadSetting("widget_mode", widget_mode);
         LoadSetting("effect_icon_size", effect_icon_size);
         LoadSetting("cooldown_icon_size", cooldown_icon_size);
@@ -900,9 +914,6 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         for (auto& skill_id : cooldown_ids) {
             skill_id = std::max(0, skill_id);
         }
-        for (auto& model_id : natural_resistance_model_ids) {
-            model_id = std::max(0, model_id);
-        }
         effect_icon_size = std::clamp(effect_icon_size, 12.f, 64.f);
         cooldown_icon_size = std::clamp(cooldown_icon_size, 12.f, 64.f);
     }
@@ -922,7 +933,7 @@ void SlopAuras::SaveSettings(const wchar_t* folder)
         SaveSetting("cast_by_me_entries", cast_by_me_entries);
         SaveSetting("cast_by_me_ids", std::vector<int>{});
         SaveSetting("cooldown_ids", cooldown_ids);
-        SaveSetting("natural_resistance_model_ids", natural_resistance_model_ids);
+        SaveSetting("natural_resistance_agent_names", natural_resistance_agent_names);
         SaveSetting("widget_mode", widget_mode);
         SaveSetting("effect_icon_size", effect_icon_size);
         SaveSetting("cooldown_icon_size", cooldown_icon_size);
