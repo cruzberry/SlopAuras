@@ -123,7 +123,6 @@ private:
     bool widget_mode = false;
     bool enemy_nameplates_enabled = true;
     bool nameplate_show_knockdown = true;
-    bool nameplate_show_status = true;
     bool nameplate_show_effects = true;
     bool nameplate_show_cooldowns = true;
     float effect_icon_size = 22.f;

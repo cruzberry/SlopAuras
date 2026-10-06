@@ -68,6 +68,41 @@ namespace {
         return living && living->allegiance == GW::Constants::Allegiance::Enemy;
     }
 
+    GW::Constants::SkillID GetConditionIconSkill(const uint32_t condition)
+    {
+        using GW::Constants::EffectID;
+        using GW::Constants::SkillID;
+        switch (condition) {
+        case static_cast<uint32_t>(EffectID::bleeding):
+        case static_cast<uint32_t>(SkillID::Bleeding):
+            return SkillID::Bleeding;
+        case static_cast<uint32_t>(EffectID::blind):
+        case static_cast<uint32_t>(SkillID::Blind):
+            return SkillID::Blind;
+        case static_cast<uint32_t>(EffectID::burning):
+        case static_cast<uint32_t>(SkillID::Burning):
+            return SkillID::Burning;
+        case static_cast<uint32_t>(SkillID::Crippled):
+            return SkillID::Crippled;
+        case static_cast<uint32_t>(SkillID::Deep_Wound):
+            return SkillID::Deep_Wound;
+        case static_cast<uint32_t>(EffectID::disease):
+        case static_cast<uint32_t>(SkillID::Disease):
+            return SkillID::Disease;
+        case static_cast<uint32_t>(EffectID::poison):
+        case static_cast<uint32_t>(SkillID::Poison):
+            return SkillID::Poison;
+        case static_cast<uint32_t>(EffectID::dazed):
+        case static_cast<uint32_t>(SkillID::Dazed):
+            return SkillID::Dazed;
+        case static_cast<uint32_t>(EffectID::weakness):
+        case static_cast<uint32_t>(SkillID::Weakness):
+            return SkillID::Weakness;
+        default:
+            return SkillID::No_Skill;
+        }
+    }
+
     struct AgentProjection {
         DirectX::XMMATRIX view_projection;
         uint32_t viewport_width;
@@ -951,7 +986,12 @@ void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
             continue;
         }
 
-        std::vector<std::pair<std::string, ImU32>> lines;
+        struct NameplateLine {
+            std::string text;
+            ImU32 color;
+            IDirect3DTexture9* icon = nullptr;
+        };
+        std::vector<NameplateLine> lines;
         if (nameplate_show_knockdown && living->GetIsKnockedDown()) {
             const auto timer = std::ranges::find_if(knockdowns, [agent](const TrackedKnockdown& knockdown) {
                 return knockdown.agent_id == agent->agent_id;
@@ -966,28 +1006,6 @@ void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
             }
         }
 
-        if (nameplate_show_status) {
-            std::string statuses;
-            const auto add_status = [&statuses](const char* status) {
-                if (!statuses.empty()) {
-                    statuses += " | ";
-                }
-                statuses += status;
-            };
-            if (living->GetIsHexed()) {
-                add_status("HEXED");
-            }
-            if (living->GetIsConditioned()) {
-                add_status("CONDITIONED");
-            }
-            if (living->GetIsEnchanted()) {
-                add_status("ENCHANTED");
-            }
-            if (!statuses.empty()) {
-                lines.emplace_back(std::move(statuses), IM_COL32(238, 205, 120, 255));
-            }
-        }
-
         if (nameplate_show_effects) {
             for (const auto& cast : casts) {
                 if (cast.target_agent_id != agent->agent_id
@@ -998,9 +1016,34 @@ void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
                 if (elapsed >= cast.duration_ms) {
                     continue;
                 }
-                const auto name = GetSkillName(static_cast<int>(cast.skill_id));
-                lines.emplace_back(std::format("{}  {:.1f}s", name,
-                    static_cast<double>(cast.duration_ms - elapsed) / 1000.0), IM_COL32(190, 225, 255, 255));
+                const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast.skill_id));
+                if (!skill) {
+                    continue;
+                }
+                auto icon_skill_id = GW::Constants::SkillID::No_Skill;
+                if (skill->type == GW::Constants::SkillType::Hex) {
+                    icon_skill_id = static_cast<GW::Constants::SkillID>(cast.skill_id);
+                }
+                else if (skill->condition != 0) {
+                    icon_skill_id = GetConditionIconSkill(skill->condition);
+                    if (icon_skill_id == GW::Constants::SkillID::No_Skill) {
+                        icon_skill_id = static_cast<GW::Constants::SkillID>(cast.skill_id);
+                    }
+                }
+                IDirect3DTexture9* icon_texture = nullptr;
+                if (icon_skill_id != GW::Constants::SkillID::No_Skill) {
+                    const auto icon = GetSkillImage(icon_skill_id);
+                    icon_texture = icon && *icon ? *icon : nullptr;
+                }
+                const auto remaining = std::format("{:.1f}s",
+                    static_cast<double>(cast.duration_ms - elapsed) / 1000.0);
+                if (skill->type == GW::Constants::SkillType::Hex || skill->condition != 0) {
+                    lines.push_back({remaining, IM_COL32(190, 225, 255, 255), icon_texture});
+                }
+                else {
+                    lines.push_back({std::format("{}  {}", GetSkillName(static_cast<int>(cast.skill_id)), remaining),
+                        IM_COL32(190, 225, 255, 255)});
+                }
             }
         }
 
@@ -1015,8 +1058,8 @@ void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
                     continue;
                 }
                 const auto name = GetSkillName(static_cast<int>(cooldown.skill_id));
-                lines.emplace_back(std::format("CD {}  {:.1f}s", name,
-                    static_cast<double>(cooldown.duration_ms - elapsed) / 1000.0), IM_COL32(255, 190, 135, 255));
+                lines.push_back({std::format("CD {}  {:.1f}s", name,
+                    static_cast<double>(cooldown.duration_ms - elapsed) / 1000.0), IM_COL32(255, 190, 135, 255)});
             }
         }
 
@@ -1032,12 +1075,12 @@ void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
         text_sizes.reserve(lines.size());
         float max_width = 0.f;
         float total_height = 0.f;
-        for (const auto& [text, color] : lines) {
-            static_cast<void>(color);
-            const auto text_size = ImGui::CalcTextSize(text.c_str());
+        for (const auto& line : lines) {
+            const auto text_size = ImGui::CalcTextSize(line.text.c_str());
             text_sizes.push_back(text_size);
-            max_width = std::max(max_width, text_size.x);
-            total_height += text_size.y;
+            const auto line_width = text_size.x + (line.icon ? effect_icon_size + 4.f : 0.f);
+            max_width = std::max(max_width, line_width);
+            total_height += std::max(text_size.y, line.icon ? effect_icon_size : 0.f);
         }
         constexpr float vertical_spacing = 1.f;
         total_height += vertical_spacing * static_cast<float>(lines.size() - 1);
@@ -1047,9 +1090,20 @@ void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
             ImVec2(left + max_width + 6.f, top + total_height + 1.f), IM_COL32(0, 0, 0, 170), 2.f);
         auto y = top;
         for (size_t i = 0; i < lines.size(); ++i) {
-            const auto& [text, color] = lines[i];
-            draw_list->AddText(ImVec2(name_position.x - text_sizes[i].x * 0.5f, y), color, text.c_str());
-            y += text_sizes[i].y + vertical_spacing;
+            const auto& line = lines[i];
+            const auto row_height = std::max(text_sizes[i].y, line.icon ? effect_icon_size : 0.f);
+            const auto row_width = text_sizes[i].x + (line.icon ? effect_icon_size + 4.f : 0.f);
+            auto x = name_position.x - row_width * 0.5f;
+            if (line.icon) {
+                const auto icon_y = y + (row_height - effect_icon_size) * 0.5f;
+                draw_list->AddImage((ImTextureID)(intptr_t)line.icon, ImVec2(x, icon_y),
+                    ImVec2(x + effect_icon_size, icon_y + effect_icon_size));
+                x += effect_icon_size + 4.f;
+            }
+            if (!line.text.empty()) {
+                draw_list->AddText(ImVec2(x, y + (row_height - text_sizes[i].y) * 0.5f), line.color, line.text.c_str());
+            }
+            y += row_height + vertical_spacing;
         }
     }
 }
@@ -1398,10 +1452,9 @@ void SlopAuras::DrawSettingsWindow()
     ImGui::TextUnformatted("Enemy nameplates");
     settings_changed |= ImGui::Checkbox("Show enemy nameplate overlays", &enemy_nameplates_enabled);
     settings_changed |= ImGui::Checkbox("Show knockdown and timer", &nameplate_show_knockdown);
-    settings_changed |= ImGui::Checkbox("Show hex, condition, and enchantment status", &nameplate_show_status);
     settings_changed |= ImGui::Checkbox("Show tracked player effects", &nameplate_show_effects);
     settings_changed |= ImGui::Checkbox("Show tracked enemy cooldowns", &nameplate_show_cooldowns);
-    ImGui::TextWrapped("Overlays are drawn below the game's selectable enemy names. Tracked effects and cooldowns use the configured skill IDs.");
+    ImGui::TextWrapped("Only tracked effects and cooldowns are shown. Hexes and conditions use their icons and estimated remaining timers.");
     if (settings_changed) {
         SaveSettings(nullptr);
     }
@@ -1636,7 +1689,6 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         LoadSetting("cooldown_icon_size", cooldown_icon_size);
         LoadSetting("enemy_nameplates_enabled", enemy_nameplates_enabled);
         LoadSetting("nameplate_show_knockdown", nameplate_show_knockdown);
-        LoadSetting("nameplate_show_status", nameplate_show_status);
         LoadSetting("nameplate_show_effects", nameplate_show_effects);
         LoadSetting("nameplate_show_cooldowns", nameplate_show_cooldowns);
         LoadSetting("notification_enabled", notification_enabled);
@@ -1696,7 +1748,6 @@ void SlopAuras::SaveSettings(const wchar_t* folder)
         SaveSetting("cooldown_icon_size", cooldown_icon_size);
         SaveSetting("enemy_nameplates_enabled", enemy_nameplates_enabled);
         SaveSetting("nameplate_show_knockdown", nameplate_show_knockdown);
-        SaveSetting("nameplate_show_status", nameplate_show_status);
         SaveSetting("nameplate_show_effects", nameplate_show_effects);
         SaveSetting("nameplate_show_cooldowns", nameplate_show_cooldowns);
         SaveSetting("notification_enabled", notification_enabled);
