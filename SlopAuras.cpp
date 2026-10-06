@@ -4,19 +4,24 @@
 
 #include <Windows.h>
 #include <commdlg.h>
+#include <cmath>
+#include <d3d9.h>
 #include <mmsystem.h>
 
 #include <cctype>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 #include <GWCA/Constants/Constants.h>
 #include <GWCA/Context/WorldContext.h>
 #include <GWCA/GameEntities/Agent.h>
 #include <GWCA/GameEntities/Attribute.h>
+#include <GWCA/GameEntities/Camera.h>
 #include <GWCA/GameEntities/Skill.h>
 #include <GWCA/GameEntities/Title.h>
 #include <GWCA/Managers/AgentMgr.h>
+#include <GWCA/Managers/CameraMgr.h>
 #include <GWCA/Managers/EffectMgr.h>
 #include <GWCA/Managers/GameThreadMgr.h>
 #include <GWCA/Managers/ItemMgr.h>
@@ -25,8 +30,10 @@
 #include <GWCA/Managers/PartyMgr.h>
 #include <GWCA/Managers/PlayerMgr.h>
 #include <GWCA/Managers/SkillbarMgr.h>
+#include <GWCA/Packets/StoC.h>
 #include <GWCA/Managers/UIMgr.h>
 
+#include <DirectXMath.h>
 #pragma comment(lib, "Comdlg32.lib")
 #pragma comment(lib, "Winmm.lib")
 
@@ -59,6 +66,94 @@ namespace {
         const auto* agent = GW::Agents::GetAgentByID(agent_id);
         const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
         return living && living->allegiance == GW::Constants::Allegiance::Enemy;
+    }
+
+    GW::Constants::SkillID GetConditionIconSkill(const uint32_t condition)
+    {
+        using GW::Constants::EffectID;
+        using GW::Constants::SkillID;
+        switch (condition) {
+        case static_cast<uint32_t>(EffectID::bleeding):
+        case static_cast<uint32_t>(SkillID::Bleeding):
+            return SkillID::Bleeding;
+        case static_cast<uint32_t>(EffectID::blind):
+        case static_cast<uint32_t>(SkillID::Blind):
+            return SkillID::Blind;
+        case static_cast<uint32_t>(EffectID::burning):
+        case static_cast<uint32_t>(SkillID::Burning):
+            return SkillID::Burning;
+        case static_cast<uint32_t>(SkillID::Crippled):
+            return SkillID::Crippled;
+        case static_cast<uint32_t>(SkillID::Deep_Wound):
+            return SkillID::Deep_Wound;
+        case static_cast<uint32_t>(EffectID::disease):
+        case static_cast<uint32_t>(SkillID::Disease):
+            return SkillID::Disease;
+        case static_cast<uint32_t>(EffectID::poison):
+        case static_cast<uint32_t>(SkillID::Poison):
+            return SkillID::Poison;
+        case static_cast<uint32_t>(EffectID::dazed):
+        case static_cast<uint32_t>(SkillID::Dazed):
+            return SkillID::Dazed;
+        case static_cast<uint32_t>(EffectID::weakness):
+        case static_cast<uint32_t>(SkillID::Weakness):
+            return SkillID::Weakness;
+        default:
+            return SkillID::No_Skill;
+        }
+    }
+
+    struct AgentProjection {
+        DirectX::XMMATRIX view_projection;
+        uint32_t viewport_width;
+        uint32_t viewport_height;
+    };
+
+    bool GetAgentProjection(AgentProjection& projection)
+    {
+        const auto* camera = GW::CameraMgr::GetCamera();
+        const auto viewport_width = GW::Render::GetViewportWidth();
+        const auto viewport_height = GW::Render::GetViewportHeight();
+        const auto fov = GW::Render::GetFieldOfView();
+        if (!camera || !viewport_width || !viewport_height || !std::isfinite(fov) || fov <= 0.f) {
+            return false;
+        }
+        const auto eye = DirectX::XMVectorSet(camera->position.x, camera->position.y, camera->position.z, 1.f);
+        const auto target = DirectX::XMVectorSet(camera->look_at_target.x, camera->look_at_target.y, camera->look_at_target.z, 1.f);
+        const auto up = DirectX::XMVectorSet(0.f, 0.f, -1.f, 0.f);
+        const auto view = DirectX::XMMatrixLookAtLH(eye, target, up);
+        const auto projection_matrix = DirectX::XMMatrixPerspectiveFovLH(
+            fov, static_cast<float>(viewport_width) / static_cast<float>(viewport_height), 0.1f, 100000.f);
+        projection.view_projection = DirectX::XMMatrixMultiply(view, projection_matrix);
+        projection.viewport_width = viewport_width;
+        projection.viewport_height = viewport_height;
+        return true;
+    }
+
+    bool ProjectAgentNameToScreen(const AgentProjection& projection, const GW::Agent* agent, ImVec2& screen_position)
+    {
+        if (!agent) {
+            return false;
+        }
+        const auto world_position = DirectX::XMVectorSet(agent->name_tag_x, agent->name_tag_y, agent->name_tag_z, 1.f);
+        const auto clip_position = DirectX::XMVector4Transform(world_position, projection.view_projection);
+        DirectX::XMFLOAT4 clip;
+        DirectX::XMStoreFloat4(&clip, clip_position);
+        if (!std::isfinite(clip.x) || !std::isfinite(clip.y) || !std::isfinite(clip.z)
+            || !std::isfinite(clip.w) || clip.w <= 0.f) {
+            return false;
+        }
+
+        const auto depth = clip.z / clip.w;
+        const auto normalized_x = clip.x / clip.w;
+        const auto normalized_y = clip.y / clip.w;
+        if (depth < 0.f || depth > 1.f || normalized_x < -1.f || normalized_x > 1.f
+            || normalized_y < -1.f || normalized_y > 1.f) {
+            return false;
+        }
+        screen_position.x = (normalized_x + 1.f) * static_cast<float>(projection.viewport_width) * 0.5f;
+        screen_position.y = (1.f - normalized_y) * static_cast<float>(projection.viewport_height) * 0.5f;
+        return std::isfinite(screen_position.x) && std::isfinite(screen_position.y);
     }
 
     bool IsTrackedCastType(const GW::Skill* skill)
@@ -604,10 +699,42 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
         std::lock_guard lock(tracking_mutex);
         tracked_casts.clear();
         tracked_cooldowns.clear();
+        tracked_knockdowns.clear();
         pending_casts.clear();
         player_effect_notifications.clear();
         player_effect_snapshot_initialized = false;
     });
+    const auto knockdown_callback_registered = GW::StoC::RegisterPacketCallback<GW::Packet::StoC::GenericFloat>(&knockdown_hook, [this](GW::HookStatus*, GW::Packet::StoC::GenericFloat* packet) {
+        if (!packet || packet->type != GW::Packet::StoC::GenericValueID::knocked_down
+            || !IsMapReady() || !std::isfinite(packet->value) || packet->value <= 0.f
+            || !IsEnemyAgent(packet->agent_id)) {
+            return;
+        }
+        const auto duration_ms_value = static_cast<double>(packet->value) * 1000.0;
+        if (duration_ms_value > static_cast<double>(std::numeric_limits<uint32_t>::max())) {
+            return;
+        }
+        const auto generation = map_generation.load(std::memory_order_acquire);
+        const auto now = GW::MemoryMgr::GetSkillTimer();
+        const auto duration_ms = static_cast<uint32_t>(duration_ms_value);
+        std::lock_guard lock(tracking_mutex);
+        if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+            return;
+        }
+        const auto existing = std::ranges::find_if(tracked_knockdowns, [packet](const TrackedKnockdown& knockdown) {
+            return knockdown.agent_id == packet->agent_id;
+        });
+        if (existing != tracked_knockdowns.end()) {
+            existing->timestamp = now;
+            existing->duration_ms = duration_ms;
+        }
+        else {
+            tracked_knockdowns.push_back({packet->agent_id, now, duration_ms});
+        }
+    });
+    if (!knockdown_callback_registered) {
+        OutputDebugStringW(L"SlopAuras: could not register the enemy knockdown timer callback.\n");
+    }
     GW::UI::RegisterUIMessageCallback(&skill_started_cast_hook, GW::UI::UIMessage::kAgentSkillStartedCast, [this](GW::HookStatus*, GW::UI::UIMessage, void* wparam, void*) {
         const auto* packet = static_cast<GW::UI::UIPacket::kAgentSkillStartedCast*>(wparam);
         if (!packet || !IsMapReady()
@@ -698,10 +825,12 @@ void SlopAuras::Terminate()
     GW::UI::RemoveUIMessageCallback(&skill_activated_hook);
     GW::UI::RemoveUIMessageCallback(&skill_started_cast_hook);
     GW::UI::RemoveUIMessageCallback(&map_loading_hook);
+    GW::StoC::RemoveCallback<GW::Packet::StoC::GenericFloat>(&knockdown_hook);
     {
         std::lock_guard lock(tracking_mutex);
         tracked_casts.clear();
         tracked_cooldowns.clear();
+        tracked_knockdowns.clear();
         pending_casts.clear();
         player_effect_notifications.clear();
         player_effect_snapshot_initialized = false;
@@ -874,10 +1003,180 @@ void SlopAuras::Update(float delta)
             }
             return true;
         });
+        std::erase_if(tracked_knockdowns, [this, now](const TrackedKnockdown& knockdown) {
+            if (now - knockdown.timestamp >= knockdown.duration_ms) {
+                return true;
+            }
+            const auto* agent = GW::Agents::GetAgentByID(knockdown.agent_id);
+            const auto* living = agent ? agent->GetAsAgentLiving() : nullptr;
+            return !living || !living->GetIsAlive() || living->allegiance != GW::Constants::Allegiance::Enemy;
+        });
     }
     for (size_t index = 0; index < pending_notifications.size(); ++index) {
         if (pending_notifications[index]) {
             PlayNotification(static_cast<NotificationType>(index));
+        }
+    }
+}
+
+void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
+{
+    if (!enemy_nameplates_enabled || !device || !IsMapReady()) {
+        return;
+    }
+
+    const auto generation = map_generation.load(std::memory_order_acquire);
+    const auto now = GW::MemoryMgr::GetSkillTimer();
+    std::vector<int> tracked_effect_ids;
+    std::vector<int> tracked_cooldown_ids;
+    std::vector<TrackedCast> casts;
+    std::vector<TrackedCooldown> cooldowns;
+    std::vector<TrackedKnockdown> knockdowns;
+    {
+        std::lock_guard lock(tracking_mutex);
+        tracked_effect_ids = effect_ids;
+        tracked_cooldown_ids = cooldown_ids;
+        casts = tracked_casts;
+        cooldowns = tracked_cooldowns;
+        knockdowns = tracked_knockdowns;
+    }
+
+    if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+        return;
+    }
+    const auto* agents = GW::Agents::GetAgentArray();
+    AgentProjection projection;
+    if (!agents || !GetAgentProjection(projection)) {
+        return;
+    }
+    auto* draw_list = ImGui::GetForegroundDrawList();
+    for (const auto* agent : *agents) {
+        if (!agent || generation != map_generation.load(std::memory_order_acquire)) {
+            continue;
+        }
+        const auto* living = agent->GetAsAgentLiving();
+        if (!living || !living->GetIsAlive() || living->allegiance != GW::Constants::Allegiance::Enemy) {
+            continue;
+        }
+
+        struct NameplateLine {
+            std::string text;
+            ImU32 color;
+            IDirect3DTexture9* icon = nullptr;
+        };
+        std::vector<NameplateLine> lines;
+        if (nameplate_show_knockdown && living->GetIsKnockedDown()) {
+            const auto timer = std::ranges::find_if(knockdowns, [agent](const TrackedKnockdown& knockdown) {
+                return knockdown.agent_id == agent->agent_id;
+            });
+            if (timer != knockdowns.end() && now - timer->timestamp < timer->duration_ms) {
+                const auto remaining = timer->duration_ms - (now - timer->timestamp);
+                lines.emplace_back(std::format("DOWN  {:.1f}s", static_cast<double>(remaining) / 1000.0),
+                    IM_COL32(255, 90, 80, 255));
+            }
+            else {
+                lines.emplace_back("KNOCKED DOWN", IM_COL32(255, 90, 80, 255));
+            }
+        }
+
+        if (nameplate_show_effects) {
+            for (const auto& cast : casts) {
+                if (cast.target_agent_id != agent->agent_id
+                    || std::ranges::find(tracked_effect_ids, static_cast<int>(cast.skill_id)) == tracked_effect_ids.end()) {
+                    continue;
+                }
+                const auto elapsed = now - cast.timestamp;
+                if (elapsed >= cast.duration_ms) {
+                    continue;
+                }
+                const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast.skill_id));
+                if (!skill) {
+                    continue;
+                }
+                auto icon_skill_id = GW::Constants::SkillID::No_Skill;
+                if (skill->type == GW::Constants::SkillType::Hex) {
+                    icon_skill_id = static_cast<GW::Constants::SkillID>(cast.skill_id);
+                }
+                else if (skill->condition != 0) {
+                    icon_skill_id = GetConditionIconSkill(skill->condition);
+                    if (icon_skill_id == GW::Constants::SkillID::No_Skill) {
+                        icon_skill_id = static_cast<GW::Constants::SkillID>(cast.skill_id);
+                    }
+                }
+                IDirect3DTexture9* icon_texture = nullptr;
+                if (icon_skill_id != GW::Constants::SkillID::No_Skill) {
+                    const auto icon = GetSkillImage(icon_skill_id);
+                    icon_texture = icon && *icon ? *icon : nullptr;
+                }
+                const auto remaining = std::format("{:.1f}s",
+                    static_cast<double>(cast.duration_ms - elapsed) / 1000.0);
+                if (skill->type == GW::Constants::SkillType::Hex || skill->condition != 0) {
+                    lines.push_back({remaining, IM_COL32(190, 225, 255, 255), icon_texture});
+                }
+                else {
+                    lines.push_back({std::format("{}  {}", GetSkillName(static_cast<int>(cast.skill_id)), remaining),
+                        IM_COL32(190, 225, 255, 255)});
+                }
+            }
+        }
+
+        if (nameplate_show_cooldowns) {
+            for (const auto& cooldown : cooldowns) {
+                if (cooldown.agent_id != agent->agent_id
+                    || std::ranges::find(tracked_cooldown_ids, static_cast<int>(cooldown.skill_id)) == tracked_cooldown_ids.end()) {
+                    continue;
+                }
+                const auto elapsed = now - cooldown.timestamp;
+                if (elapsed >= cooldown.duration_ms) {
+                    continue;
+                }
+                const auto name = GetSkillName(static_cast<int>(cooldown.skill_id));
+                lines.push_back({std::format("CD {}  {:.1f}s", name,
+                    static_cast<double>(cooldown.duration_ms - elapsed) / 1000.0), IM_COL32(255, 190, 135, 255)});
+            }
+        }
+
+        if (lines.empty()) {
+            continue;
+        }
+        ImVec2 name_position;
+        if (!ProjectAgentNameToScreen(projection, agent, name_position)) {
+            continue;
+        }
+
+        std::vector<ImVec2> text_sizes;
+        text_sizes.reserve(lines.size());
+        float max_width = 0.f;
+        float total_height = 0.f;
+        for (const auto& line : lines) {
+            const auto text_size = ImGui::CalcTextSize(line.text.c_str());
+            text_sizes.push_back(text_size);
+            const auto line_width = text_size.x + (line.icon ? effect_icon_size + 4.f : 0.f);
+            max_width = std::max(max_width, line_width);
+            total_height += std::max(text_size.y, line.icon ? effect_icon_size : 0.f);
+        }
+        constexpr float vertical_spacing = 1.f;
+        total_height += vertical_spacing * static_cast<float>(lines.size() - 1);
+        const auto left = name_position.x - max_width * 0.5f - 3.f;
+        const auto top = name_position.y + 7.f;
+        draw_list->AddRectFilled(ImVec2(left, top - 1.f),
+            ImVec2(left + max_width + 6.f, top + total_height + 1.f), IM_COL32(0, 0, 0, 170), 2.f);
+        auto y = top;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            const auto& line = lines[i];
+            const auto row_height = std::max(text_sizes[i].y, line.icon ? effect_icon_size : 0.f);
+            const auto row_width = text_sizes[i].x + (line.icon ? effect_icon_size + 4.f : 0.f);
+            auto x = name_position.x - row_width * 0.5f;
+            if (line.icon) {
+                const auto icon_y = y + (row_height - effect_icon_size) * 0.5f;
+                draw_list->AddImage((ImTextureID)(intptr_t)line.icon, ImVec2(x, icon_y),
+                    ImVec2(x + effect_icon_size, icon_y + effect_icon_size));
+                x += effect_icon_size + 4.f;
+            }
+            if (!line.text.empty()) {
+                draw_list->AddText(ImVec2(x, y + (row_height - text_sizes[i].y) * 0.5f), line.color, line.text.c_str());
+            }
+            y += row_height + vertical_spacing;
         }
     }
 }
@@ -1047,8 +1346,9 @@ void SlopAuras::TrackEnemyCooldown(const uint32_t agent_id, const uint32_t skill
     }
 }
 
-void SlopAuras::Draw(IDirect3DDevice9*)
+void SlopAuras::Draw(IDirect3DDevice9* pDevice)
 {
+    DrawEnemyNameplates(pDevice);
     const auto generation = map_generation.load(std::memory_order_acquire);
     const auto map_is_current = [this, generation] {
         return generation == map_generation.load(std::memory_order_acquire) && IsMapReady();
@@ -1245,6 +1545,13 @@ void SlopAuras::DrawSettingsWindow()
     }
     settings_changed |= ImGui::SliderFloat("Effect icon size", &effect_icon_size, 12.f, 64.f, "%.0f px");
     settings_changed |= ImGui::SliderFloat("Cooldown icon size", &cooldown_icon_size, 12.f, 64.f, "%.0f px");
+    ImGui::Separator();
+    ImGui::TextUnformatted("Enemy nameplates");
+    settings_changed |= ImGui::Checkbox("Show enemy nameplate overlays", &enemy_nameplates_enabled);
+    settings_changed |= ImGui::Checkbox("Show knockdown and timer", &nameplate_show_knockdown);
+    settings_changed |= ImGui::Checkbox("Show tracked player effects", &nameplate_show_effects);
+    settings_changed |= ImGui::Checkbox("Show tracked enemy cooldowns", &nameplate_show_cooldowns);
+    ImGui::TextWrapped("Only tracked effects and cooldowns are shown. Hexes and conditions use their icons and estimated remaining timers.");
     if (settings_changed) {
         SaveSettings(nullptr);
     }
@@ -1475,6 +1782,10 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         LoadSetting("widget_mode", widget_mode);
         LoadSetting("effect_icon_size", effect_icon_size);
         LoadSetting("cooldown_icon_size", cooldown_icon_size);
+        LoadSetting("enemy_nameplates_enabled", enemy_nameplates_enabled);
+        LoadSetting("nameplate_show_knockdown", nameplate_show_knockdown);
+        LoadSetting("nameplate_show_effects", nameplate_show_effects);
+        LoadSetting("nameplate_show_cooldowns", nameplate_show_cooldowns);
         LoadSetting("notification_enabled", notification_enabled);
         LoadSetting("notification_sound_paths", notification_sound_paths);
         LoadSetting("notification_lead_seconds", notification_lead_seconds);
@@ -1513,6 +1824,10 @@ void SlopAuras::SaveSettings(const wchar_t* folder)
         SaveSetting("widget_mode", widget_mode);
         SaveSetting("effect_icon_size", effect_icon_size);
         SaveSetting("cooldown_icon_size", cooldown_icon_size);
+        SaveSetting("enemy_nameplates_enabled", enemy_nameplates_enabled);
+        SaveSetting("nameplate_show_knockdown", nameplate_show_knockdown);
+        SaveSetting("nameplate_show_effects", nameplate_show_effects);
+        SaveSetting("nameplate_show_cooldowns", nameplate_show_cooldowns);
         SaveSetting("notification_enabled", notification_enabled);
         SaveSetting("notification_sound_paths", notification_sound_paths);
         SaveSetting("notification_lead_seconds", notification_lead_seconds);

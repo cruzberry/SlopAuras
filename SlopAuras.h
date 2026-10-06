@@ -11,6 +11,7 @@
 
 #include <ToolboxUIPlugin.h>
 #include <GWCA/Managers/ChatMgr.h>
+#include <GWCA/Managers/StoCMgr.h>
 #include <GWCA/Managers/UIMgr.h>
 
 class SlopAuras : public ToolboxUIPlugin {
@@ -55,6 +56,12 @@ private:
         uint32_t duration_ms;
     };
 
+    struct TrackedKnockdown {
+        uint32_t agent_id;
+        uint32_t timestamp;
+        uint32_t duration_ms;
+    };
+
     struct PendingCast {
         uint32_t skill_id;
         uint32_t target_agent_id;
@@ -80,6 +87,7 @@ private:
     void StopNotificationWorker();
     void SetNotificationsMuted(bool muted);
     bool IsMapReady() const;
+    void DrawEnemyNameplates(IDirect3DDevice9* device);
     static void HandleChatCommand(GW::HookStatus* status, const wchar_t* command, int argc, const LPWSTR* argv);
     void DrawSettingsWindow();
 
@@ -87,6 +95,7 @@ private:
     GW::HookEntry skill_activated_hook;
     GW::HookEntry skill_started_cast_hook;
     GW::HookEntry map_loading_hook;
+    GW::HookEntry knockdown_hook;
     std::atomic<uint32_t> map_generation = 0;
     std::atomic<uint32_t> ready_map_generation = 0;
     std::mutex tracking_mutex;
@@ -96,6 +105,7 @@ private:
     std::vector<std::string> natural_resistance_agent_names;
     std::vector<TrackedCast> tracked_casts;
     std::vector<TrackedCooldown> tracked_cooldowns;
+    std::vector<TrackedKnockdown> tracked_knockdowns;
     std::vector<PendingCast> pending_casts;
     std::vector<PlayerEffectNotification> player_effect_notifications;
     std::vector<int> player_effect_ids_snapshot;
@@ -114,6 +124,10 @@ private:
     float notification_lead_seconds = 3.f;
     bool settings_window_visible = false;
     bool widget_mode = false;
+    bool enemy_nameplates_enabled = true;
+    bool nameplate_show_knockdown = true;
+    bool nameplate_show_effects = true;
+    bool nameplate_show_cooldowns = true;
     float effect_icon_size = 22.f;
     float cooldown_icon_size = 22.f;
 };
