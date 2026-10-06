@@ -42,6 +42,7 @@ private:
 
     void TrackCast(int skill_id, uint32_t target_agent_id);
     void TrackEnemyCooldown(uint32_t agent_id, uint32_t skill_id);
+    void PrintTrackedEffects();
     bool IsMapReady() const;
     static void HandleChatCommand(GW::HookStatus* status, const wchar_t* command, int argc, const LPWSTR* argv);
     void DrawSettingsWindow();

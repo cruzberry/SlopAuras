@@ -5,6 +5,8 @@
 #include <Windows.h>
 
 #include <cctype>
+#include <iomanip>
+#include <sstream>
 
 #include <GWCA/Constants/Constants.h>
 #include <GWCA/GameEntities/Agent.h>
@@ -191,6 +193,22 @@ namespace {
         const auto name = GetDecodedName(encoded);
         return name.empty() ? "Unknown target" : name;
     }
+
+    std::wstring ToWideString(const std::string& value)
+    {
+        if (value.empty()) {
+            return {};
+        }
+        const auto length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+            static_cast<int>(value.size()), nullptr, 0);
+        if (!length) {
+            return L"Unknown name";
+        }
+        std::wstring result(static_cast<size_t>(length), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+            static_cast<int>(value.size()), result.data(), length);
+        return result;
+    }
 }
 
 DLLAPI ToolboxPlugin* ToolboxPluginInstance()
@@ -210,6 +228,7 @@ void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const 
         GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa help - What you just typed!", L"SlopAuras");
         GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa hide - Hide the SlopAuras window.", L"SlopAuras");
         GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa show - Show the SlopAuras window.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"/sa print - Print tracked effects and enemy cooldowns.", L"SlopAuras");
     };
 
     if (argc != 2 || !argv || !argv[1]) {
@@ -225,8 +244,148 @@ void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const 
     else if (subcommand == L"show") {
         *instance->GetVisiblePtr() = true;
     }
+    else if (subcommand == L"print") {
+        instance->PrintTrackedEffects();
+    }
     else {
         print_help();
+    }
+}
+
+void SlopAuras::PrintTrackedEffects()
+{
+    if (!IsMapReady()) {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"SlopAuras: Map is not ready.", L"SlopAuras");
+        return;
+    }
+
+    const auto generation = map_generation.load(std::memory_order_acquire);
+    const auto now = GW::MemoryMgr::GetSkillTimer();
+    std::vector<int> tracked_skill_ids;
+    std::vector<int> cast_by_me_snapshot;
+    std::vector<int> cooldown_ids_snapshot;
+    std::vector<std::string> natural_resistance_names;
+    std::vector<TrackedCast> tracked_casts_snapshot;
+    std::vector<TrackedCooldown> tracked_cooldowns_snapshot;
+    {
+        std::lock_guard lock(tracking_mutex);
+        tracked_skill_ids = effect_ids;
+        cast_by_me_snapshot = cast_by_me_entries;
+        cooldown_ids_snapshot = cooldown_ids;
+        natural_resistance_names = natural_resistance_agent_names;
+        tracked_casts_snapshot = tracked_casts;
+        tracked_cooldowns_snapshot = tracked_cooldowns;
+    }
+
+    struct ActiveEffect {
+        int skill_id;
+        uint32_t target_agent_id;
+        DWORD remaining;
+    };
+    std::vector<ActiveEffect> active_effects;
+    const auto add_active_effect = [&active_effects](const int skill_id, const uint32_t target_agent_id, const DWORD remaining) {
+        const auto existing = std::ranges::find_if(active_effects, [skill_id, target_agent_id](const ActiveEffect& effect) {
+            return effect.skill_id == skill_id && effect.target_agent_id == target_agent_id;
+        });
+        if (existing == active_effects.end()) {
+            active_effects.push_back({skill_id, target_agent_id, remaining});
+        }
+        else {
+            existing->remaining = std::max(existing->remaining, remaining);
+        }
+    };
+    const auto effects = GW::Effects::GetPlayerEffects();
+    for (size_t entry_index = 0; entry_index < tracked_skill_ids.size(); ++entry_index) {
+        if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+            return;
+        }
+        const auto skill_id = tracked_skill_ids[entry_index];
+        if (skill_id <= 0) {
+            continue;
+        }
+
+        const auto cast_by_me = std::ranges::find(cast_by_me_snapshot, static_cast<int>(entry_index)) != cast_by_me_snapshot.end();
+        if (effects && !cast_by_me) {
+            DWORD remaining = 0;
+            for (const auto& effect : *effects) {
+                if (static_cast<int>(effect.skill_id) == skill_id) {
+                    remaining = std::max(remaining, effect.GetTimeRemaining());
+                }
+            }
+            if (remaining > 0) {
+                add_active_effect(skill_id, GW::Agents::GetControlledCharacterId(), remaining);
+            }
+        }
+
+        for (const auto& cast : tracked_casts_snapshot) {
+            if (static_cast<int>(cast.skill_id) != skill_id) {
+                continue;
+            }
+            const auto elapsed = now - cast.timestamp;
+            if (elapsed >= cast.duration_ms) {
+                continue;
+            }
+            if (elapsed >= 1500) {
+                const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast.skill_id));
+                if (skill && skill->type != GW::Constants::SkillType::Ritual
+                    && !IsAgentEffectActive(cast.target_agent_id, cast.skill_id, skill->type)) {
+                    continue;
+                }
+            }
+            add_active_effect(skill_id, cast.target_agent_id, cast.duration_ms - elapsed);
+        }
+    }
+
+    const auto is_natural_resistance_enemy = [&natural_resistance_names](const uint32_t agent_id) {
+        if (!IsEnemyAgent(agent_id)) {
+            return false;
+        }
+        const auto target_name = NormalizeAgentName(GetAgentName(agent_id));
+        return !target_name.empty() && target_name != "loading name..." && target_name != "unknown target"
+            && std::ranges::any_of(natural_resistance_names, [&target_name](const std::string& name) {
+                return NormalizeAgentName(name) == target_name;
+            });
+    };
+
+    std::vector<std::wstring> messages;
+    for (const auto& effect : active_effects) {
+        if (is_natural_resistance_enemy(effect.target_agent_id)) {
+            continue;
+        }
+        const auto target_name = effect.target_agent_id == GW::Agents::GetControlledCharacterId()
+            ? std::string("you")
+            : GetAgentName(effect.target_agent_id);
+        std::ostringstream message;
+        message << "Effect: " << GetSkillName(effect.skill_id) << " on " << target_name << " - "
+            << std::fixed << std::setprecision(1) << static_cast<double>(effect.remaining) / 1000.0 << "s remaining";
+        messages.push_back(ToWideString(message.str()));
+    }
+
+    for (const auto& cooldown : tracked_cooldowns_snapshot) {
+        if (std::ranges::find(cooldown_ids_snapshot, static_cast<int>(cooldown.skill_id)) == cooldown_ids_snapshot.end()
+            || is_natural_resistance_enemy(cooldown.agent_id)) {
+            continue;
+        }
+        const auto elapsed = now - cooldown.timestamp;
+        if (elapsed >= cooldown.duration_ms) {
+            continue;
+        }
+        std::ostringstream message;
+        message << "Cooldown: " << GetSkillName(static_cast<int>(cooldown.skill_id)) << " on "
+            << GetAgentName(cooldown.agent_id) << " - " << std::fixed << std::setprecision(1)
+            << static_cast<double>(cooldown.duration_ms - elapsed) / 1000.0 << "s remaining";
+        messages.push_back(ToWideString(message.str()));
+    }
+
+    if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+        return;
+    }
+    if (messages.empty()) {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"SlopAuras: No tracked effects or cooldowns active.", L"SlopAuras");
+        return;
+    }
+    for (const auto& message : messages) {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, message.c_str(), L"SlopAuras");
     }
 }
 
