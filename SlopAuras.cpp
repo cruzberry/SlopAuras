@@ -1369,12 +1369,10 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         return;
     }
     ToolboxUIPlugin::LoadSettings(folder);
-    std::vector<int> legacy_cast_by_me_ids;
     {
         std::lock_guard lock(tracking_mutex);
         LoadSetting("effect_ids", effect_ids);
         LoadSetting("cast_by_me_entries", cast_by_me_entries);
-        LoadSetting("cast_by_me_ids", legacy_cast_by_me_ids);
         LoadSetting("cooldown_ids", cooldown_ids);
         LoadSetting("natural_resistance_agent_names", natural_resistance_agent_names);
         LoadSetting("widget_mode", widget_mode);
@@ -1384,23 +1382,10 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         LoadSetting("notification_sound_paths", notification_sound_paths);
         LoadSetting("notification_lead_seconds", notification_lead_seconds);
     }
-    bool migrated_legacy_settings = false;
     {
         std::lock_guard lock(tracking_mutex);
         for (auto& skill_id : effect_ids) {
             skill_id = std::max(0, skill_id);
-        }
-        if (cast_by_me_entries.empty()) {
-            for (const auto skill_id : legacy_cast_by_me_ids) {
-                const auto entry = std::ranges::find(effect_ids, skill_id);
-                if (entry != effect_ids.end()) {
-                    const auto entry_index = static_cast<int>(std::distance(effect_ids.begin(), entry));
-                    if (std::ranges::find(cast_by_me_entries, entry_index) == cast_by_me_entries.end()) {
-                        cast_by_me_entries.push_back(entry_index);
-                    }
-                }
-            }
-            migrated_legacy_settings = !legacy_cast_by_me_ids.empty();
         }
         std::erase_if(cast_by_me_entries, [this](const int index) {
             return index < 0 || static_cast<size_t>(index) >= effect_ids.size();
@@ -1415,9 +1400,6 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         player_cast_by_me_snapshot = cast_by_me_entries;
         player_effect_snapshot_initialized = false;
     }
-    if (migrated_legacy_settings) {
-        SaveSettings(folder);
-    }
 }
 
 void SlopAuras::SaveSettings(const wchar_t* folder)
@@ -1429,7 +1411,6 @@ void SlopAuras::SaveSettings(const wchar_t* folder)
         std::lock_guard lock(tracking_mutex);
         SaveSetting("effect_ids", effect_ids);
         SaveSetting("cast_by_me_entries", cast_by_me_entries);
-        SaveSetting("cast_by_me_ids", std::vector<int>{});
         SaveSetting("cooldown_ids", cooldown_ids);
         SaveSetting("natural_resistance_agent_names", natural_resistance_agent_names);
         SaveSetting("widget_mode", widget_mode);
