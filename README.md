@@ -1,13 +1,13 @@
 # SlopAuras
 
-SlopAuras is a GWToolbox++ plugin that displays remaining durations for selected player effects.
+SlopAuras is a GWToolbox++ plugin that tracks selected player effects and enemy cooldowns.
 
-To configure tracked effects, open the SlopAuras section under Toolbox's **Settings > Plugins** and select **Open SlopAuras settings**. The settings window is drawn while the main SlopAuras window is visible. The SlopAuras window lists matching effects while they are active. PvE skill durations use the associated title rank when available, including Asura and Sunspear rank scaling. Configured skills that apply conditions, such as "You Move Like a Dwarf!", can also be tracked; their timers are estimated from the cast and expire early when the target no longer reports a condition or hex. The game does not expose exact per-condition remaining time, so another active condition or hex may keep an estimate visible after the tracked one ends. Natural Resistance agents are configured by name, so the setting remains valid if an agent's model ID changes.
+Configure tracked skills in **Settings > Plugins > SlopAuras > Open SlopAuras settings**. PvE durations scale with title rank when available. Condition timers are estimates because the game does not expose exact remaining time. Configure Natural Resistance agents by name.
 
-SlopAuras provides client-side chat commands: `/sa hide` hides its window, `/sa show` shows it, `/sa print` prints active tracked effects and enemy cooldowns in chat, `/sa mute` and `/sa unmute` mute and restore sound notifications, and `/sa help` lists the commands in chat. Effects on configured Natural Resistance enemies are omitted from the printed output.
+Commands: `/sa hide`, `/sa show`, `/sa print`, `/sa mute`, `/sa unmute`, and `/sa help`. Print omits effects on configured Natural Resistance agents.
 
-Sound notifications can be enabled separately for tracked effect application, effects approaching expiration, and tracked enemy cooldown completion. Each event has its own WAV file selector; the expiration lead time is configurable. Simultaneous alerts are queued and played in order. Playback uses Windows audio independently of Guild Wars volume and mute settings. Notifications start unmuted each time SlopAuras loads.
+Sound alerts are configurable for effect application, near-expiry, and enemy cooldown completion. Choose a WAV per event and set the expiry lead time. Alerts play sequentially through Windows audio; notifications start unmuted.
 
 ## Building
 
-This plugin uses GWToolbox++ and GWCA interfaces and is built with the GWToolbox++ CMake project. To include it in that build, add the plugin source directory and register `SlopAuras` with `add_tb_plugin`.
+Build with the GWToolbox++ CMake project: add this plugin directory and register `SlopAuras` with `add_tb_plugin`.
