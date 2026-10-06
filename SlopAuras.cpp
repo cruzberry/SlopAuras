@@ -166,6 +166,26 @@ namespace {
             || skill->condition != 0);
     }
 
+    bool IsMultiAllyEffect(const GW::Skill& skill)
+    {
+        switch (skill.skill_id) {
+        case GW::Constants::SkillID::Save_Yourselves_kurzick:
+        case GW::Constants::SkillID::Save_Yourselves_luxon:
+        case GW::Constants::SkillID::Dark_Fury:
+            return true;
+        default:
+            return (skill.type == GW::Constants::SkillType::Shout && skill.condition == 0)
+                || (skill.type == GW::Constants::SkillType::Enchantment && skill.aoe_range > 0.f);
+        }
+    }
+
+    bool IsEffectTimestampNearCast(const uint32_t effect_timestamp, const uint32_t cast_timestamp)
+    {
+        constexpr uint32_t match_window_ms = 3000;
+        return effect_timestamp - cast_timestamp <= match_window_ms
+            || cast_timestamp - effect_timestamp <= match_window_ms;
+    }
+
     uint32_t GetAttributeLevel(const GW::Constants::AttributeByte attribute)
     {
         const auto* attributes = GW::PartyMgr::GetAgentAttributes(GW::Agents::GetControlledCharacterId());
@@ -594,17 +614,19 @@ void SlopAuras::PrintTrackedEffects()
                 continue;
             }
             const auto elapsed = now - cast.timestamp;
-            if (elapsed >= cast.duration_ms) {
+            const auto predicted_remaining = elapsed < cast.duration_ms ? cast.duration_ms - elapsed : 0;
+            const auto remaining = std::max(predicted_remaining, cast.observed_remaining_ms);
+            if (!remaining) {
                 continue;
             }
-            if (elapsed >= 1500) {
+            if (!cast.multi_ally && elapsed >= 1500) {
                 const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(cast.skill_id));
                 if (skill && (skill->type != GW::Constants::SkillType::Ritual || skill->condition != 0)
                     && !IsAgentEffectActive(cast.target_agent_id, *skill)) {
                     continue;
                 }
             }
-            add_active_effect(skill_id, cast.target_agent_id, cast.duration_ms - elapsed);
+            add_active_effect(skill_id, cast.multi_ally ? 0 : cast.target_agent_id, remaining);
         }
     }
 
@@ -624,9 +646,11 @@ void SlopAuras::PrintTrackedEffects()
         if (is_natural_resistance_enemy(effect.target_agent_id)) {
             continue;
         }
-        const auto target_name = effect.target_agent_id == GW::Agents::GetControlledCharacterId()
-            ? std::string("you")
-            : GetAgentName(effect.target_agent_id);
+        const auto target_name = effect.target_agent_id == 0
+            ? std::string("allies")
+            : effect.target_agent_id == GW::Agents::GetControlledCharacterId()
+                ? std::string("you")
+                : GetAgentName(effect.target_agent_id);
         std::ostringstream message;
         message << "Effect: " << GetSkillName(effect.skill_id) << " on " << target_name << " - "
             << std::fixed << std::setprecision(1) << static_cast<double>(effect.remaining) / 1000.0 << "s remaining";
@@ -836,6 +860,39 @@ void SlopAuras::Update(float delta)
     const auto now = GW::MemoryMgr::GetSkillTimer();
     std::array<bool, static_cast<size_t>(NotificationType::Count)> pending_notifications{};
     const auto player_effects = GW::Effects::GetPlayerEffects();
+    bool has_multi_ally_cast = false;
+    {
+        std::lock_guard lock(tracking_mutex);
+        has_multi_ally_cast = std::ranges::any_of(tracked_casts, [](const TrackedCast& cast) {
+            return cast.multi_ally;
+        });
+    }
+    struct PartyEffectSnapshot {
+        uint32_t skill_id;
+        uint32_t timestamp;
+        uint32_t remaining_ms;
+    };
+    std::vector<PartyEffectSnapshot> party_effect_snapshot;
+    if (has_multi_ally_cast) {
+        const auto* party_effects = GW::Effects::GetPartyEffectsArray();
+        if (party_effects && party_effects->valid()) {
+            for (const auto& agent_effects : *party_effects) {
+                if (!agent_effects.effects.valid()) {
+                    continue;
+                }
+                for (const auto& effect : agent_effects.effects) {
+                    const auto remaining = effect.GetTimeRemaining();
+                    if (remaining) {
+                        party_effect_snapshot.push_back({
+                            static_cast<uint32_t>(effect.skill_id),
+                            effect.timestamp,
+                            remaining
+                        });
+                    }
+                }
+            }
+        }
+    }
     {
         std::lock_guard lock(tracking_mutex);
         const auto tracked_effects_changed = player_effect_ids_snapshot != effect_ids
@@ -888,11 +945,26 @@ void SlopAuras::Update(float delta)
 
         for (auto cast = tracked_casts.begin(); cast != tracked_casts.end();) {
             const auto elapsed = now - cast->timestamp;
-            if (elapsed >= cast->duration_ms) {
+            const auto since_observed = now - cast->observed_updated_timestamp;
+            cast->observed_remaining_ms = since_observed < cast->observed_remaining_ms
+                ? cast->observed_remaining_ms - since_observed
+                : 0;
+            cast->observed_updated_timestamp = now;
+            if (cast->multi_ally) {
+                for (const auto& effect : party_effect_snapshot) {
+                    if (effect.skill_id == cast->skill_id
+                        && IsEffectTimestampNearCast(effect.timestamp, cast->timestamp)) {
+                        cast->observed_remaining_ms = std::max(
+                            cast->observed_remaining_ms,
+                            effect.remaining_ms);
+                    }
+                }
+            }
+            if (elapsed >= cast->duration_ms && !cast->observed_remaining_ms) {
                 cast = tracked_casts.erase(cast);
                 continue;
             }
-            if (elapsed >= 1500) {
+            if (!cast->multi_ally && elapsed >= 1500) {
                 if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
                     cast = tracked_casts.erase(cast);
                     continue;
@@ -904,7 +976,8 @@ void SlopAuras::Update(float delta)
                     continue;
                 }
             }
-            const auto remaining = cast->duration_ms - elapsed;
+            const auto predicted_remaining = elapsed < cast->duration_ms ? cast->duration_ms - elapsed : 0;
+            const auto remaining = std::max(predicted_remaining, cast->observed_remaining_ms);
             if (!cast->expiration_notified
                 && remaining <= static_cast<uint32_t>(notification_lead_seconds * 1000.f)
                 && notification_enabled[static_cast<size_t>(NotificationType::EffectExpiring)]) {
@@ -1138,13 +1211,18 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
         return;
     }
 
+    const auto multi_ally = IsMultiAllyEffect(*skill);
     const auto target_id = skill->type == GW::Constants::SkillType::Ritual
         ? GW::Agents::GetControlledCharacterId()
         : target_agent_id ? target_agent_id : GW::Agents::GetControlledCharacterId();
-    const auto resolved_target_id = (skill->type == GW::Constants::SkillType::WeaponSpell
-        || skill->type == GW::Constants::SkillType::Enchantment) && IsEnemyAgent(target_id)
-        ? GW::Agents::GetControlledCharacterId()
-        : target_id;
+    auto resolved_target_id = target_id;
+    if (multi_ally) {
+        resolved_target_id = 0;
+    }
+    else if ((skill->type == GW::Constants::SkillType::WeaponSpell
+        || skill->type == GW::Constants::SkillType::Enchantment) && IsEnemyAgent(target_id)) {
+        resolved_target_id = GW::Agents::GetControlledCharacterId();
+    }
     std::unique_lock lock(tracking_mutex);
     if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
         return;
@@ -1157,8 +1235,8 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
     })) {
         return;
     }
-    const auto target_name = NormalizeAgentName(GetAgentName(resolved_target_id));
-    if (skill->type == GW::Constants::SkillType::Hex
+    const auto target_name = resolved_target_id ? NormalizeAgentName(GetAgentName(resolved_target_id)) : std::string{};
+    if (!multi_ally && skill->type == GW::Constants::SkillType::Hex
         && !target_name.empty() && target_name != "loading name..." && target_name != "unknown target"
         && std::ranges::any_of(natural_resistance_agent_names, [&target_name](const std::string& name) {
             return NormalizeAgentName(name) == target_name;
@@ -1170,7 +1248,7 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
     }
     const auto now = GW::MemoryMgr::GetSkillTimer();
     std::erase_if(tracked_casts, [now](const TrackedCast& cast) {
-        return now - cast.timestamp >= cast.duration_ms;
+        return now - cast.timestamp >= cast.duration_ms && !cast.observed_remaining_ms;
     });
     if (skill->type == GW::Constants::SkillType::WeaponSpell) {
         std::erase_if(tracked_casts, [resolved_target_id](const TrackedCast& cast) {
@@ -1179,16 +1257,29 @@ void SlopAuras::TrackCast(const int skill_id, const uint32_t target_agent_id)
                 && tracked_skill->type == GW::Constants::SkillType::WeaponSpell;
         });
     }
-    const auto existing = std::ranges::find_if(tracked_casts, [skill_id, resolved_target_id](const TrackedCast& cast) {
-        return cast.skill_id == static_cast<uint32_t>(skill_id) && cast.target_agent_id == resolved_target_id;
+    const auto existing = std::ranges::find_if(tracked_casts, [skill_id, resolved_target_id, multi_ally](const TrackedCast& cast) {
+        return cast.skill_id == static_cast<uint32_t>(skill_id)
+            && cast.target_agent_id == resolved_target_id
+            && cast.multi_ally == multi_ally;
     });
     if (existing != tracked_casts.end()) {
         existing->timestamp = now;
         existing->duration_ms = duration_ms;
+        existing->observed_remaining_ms = 0;
+        existing->observed_updated_timestamp = now;
         existing->expiration_notified = false;
     }
     else {
-        tracked_casts.push_back({static_cast<uint32_t>(skill_id), resolved_target_id, now, duration_ms});
+        tracked_casts.push_back({
+            static_cast<uint32_t>(skill_id),
+            resolved_target_id,
+            now,
+            duration_ms,
+            false,
+            multi_ally,
+            0,
+            now
+        });
     }
     const auto notify_applied = notification_enabled[static_cast<size_t>(NotificationType::EffectApplied)];
     lock.unlock();
@@ -1351,9 +1442,13 @@ void SlopAuras::Draw(IDirect3DDevice9* pDevice)
                     break;
                 }
                 if (static_cast<int>(cast.skill_id) == skill_id) {
-                    const auto remaining = cast.duration_ms - (now - cast.timestamp);
+                    const auto elapsed = now - cast.timestamp;
+                    const auto predicted_remaining = elapsed < cast.duration_ms
+                        ? cast.duration_ms - elapsed
+                        : 0;
+                    const auto remaining = std::max(predicted_remaining, cast.observed_remaining_ms);
                     if (remaining > 0) {
-                        add_active_effect(skill_id, cast.target_agent_id, remaining);
+                        add_active_effect(skill_id, cast.multi_ally ? 0 : cast.target_agent_id, remaining);
                     }
                 }
             }
@@ -1366,9 +1461,11 @@ void SlopAuras::Draw(IDirect3DDevice9* pDevice)
             if (!map_is_current()) {
                 break;
             }
-            const auto target_name = effect.target_agent_id == GW::Agents::GetControlledCharacterId()
-                ? "you"
-                : GetAgentName(effect.target_agent_id);
+            const auto target_name = effect.target_agent_id == 0
+                ? std::string("allies")
+                : effect.target_agent_id == GW::Agents::GetControlledCharacterId()
+                    ? std::string("you")
+                    : GetAgentName(effect.target_agent_id);
             const auto icon = GetSkillImage(static_cast<GW::Constants::SkillID>(effect.skill_id));
             if (icon && *icon) {
                 ImGui::Image((ImTextureID)(intptr_t)*icon, ImVec2(effect_icon_size, effect_icon_size));
@@ -1676,12 +1773,10 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         return;
     }
     ToolboxUIPlugin::LoadSettings(folder);
-    std::vector<int> legacy_cast_by_me_ids;
     {
         std::lock_guard lock(tracking_mutex);
         LoadSetting("effect_ids", effect_ids);
         LoadSetting("cast_by_me_entries", cast_by_me_entries);
-        LoadSetting("cast_by_me_ids", legacy_cast_by_me_ids);
         LoadSetting("cooldown_ids", cooldown_ids);
         LoadSetting("natural_resistance_agent_names", natural_resistance_agent_names);
         LoadSetting("widget_mode", widget_mode);
@@ -1695,23 +1790,10 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         LoadSetting("notification_sound_paths", notification_sound_paths);
         LoadSetting("notification_lead_seconds", notification_lead_seconds);
     }
-    bool migrated_legacy_settings = false;
     {
         std::lock_guard lock(tracking_mutex);
         for (auto& skill_id : effect_ids) {
             skill_id = std::max(0, skill_id);
-        }
-        if (cast_by_me_entries.empty()) {
-            for (const auto skill_id : legacy_cast_by_me_ids) {
-                const auto entry = std::ranges::find(effect_ids, skill_id);
-                if (entry != effect_ids.end()) {
-                    const auto entry_index = static_cast<int>(std::distance(effect_ids.begin(), entry));
-                    if (std::ranges::find(cast_by_me_entries, entry_index) == cast_by_me_entries.end()) {
-                        cast_by_me_entries.push_back(entry_index);
-                    }
-                }
-            }
-            migrated_legacy_settings = !legacy_cast_by_me_ids.empty();
         }
         std::erase_if(cast_by_me_entries, [this](const int index) {
             return index < 0 || static_cast<size_t>(index) >= effect_ids.size();
@@ -1726,9 +1808,6 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         player_cast_by_me_snapshot = cast_by_me_entries;
         player_effect_snapshot_initialized = false;
     }
-    if (migrated_legacy_settings) {
-        SaveSettings(folder);
-    }
 }
 
 void SlopAuras::SaveSettings(const wchar_t* folder)
@@ -1740,7 +1819,6 @@ void SlopAuras::SaveSettings(const wchar_t* folder)
         std::lock_guard lock(tracking_mutex);
         SaveSetting("effect_ids", effect_ids);
         SaveSetting("cast_by_me_entries", cast_by_me_entries);
-        SaveSetting("cast_by_me_ids", std::vector<int>{});
         SaveSetting("cooldown_ids", cooldown_ids);
         SaveSetting("natural_resistance_agent_names", natural_resistance_agent_names);
         SaveSetting("widget_mode", widget_mode);
