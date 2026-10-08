@@ -221,6 +221,7 @@ namespace {
     constexpr uint32_t recharge_factor_ttl_ms = 30000; // speed-up effects are short-lived; forget what we learned after this
     constexpr float min_recharge_factor = 0.5f;        // recharge reductions do not stack beyond -50%
     constexpr uint32_t interrupt_match_window_ms = 1500;
+    constexpr uint32_t cast_in_progress_timeout_ms = 10000; // generous upper bound on any skill's cast time
 
     // Skill durations are whole seconds in game (the wiki progression tables are integers). Weapon spells round
     // to the nearest second with .5 rounding down; other skills use plain nearest rounding.
@@ -907,6 +908,7 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
         tracked_cooldowns.clear();
         tracked_knockdowns.clear();
         pending_casts.clear();
+        in_progress_casts.clear();
         confirmed_interrupts.clear();
         agent_recharge_factors.clear();
         player_effect_notifications.clear();
@@ -914,8 +916,7 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
     });
     const auto knockdown_callback_registered = GW::StoC::RegisterPacketCallback<GW::Packet::StoC::GenericFloat>(&knockdown_hook, [this](GW::HookStatus*, GW::Packet::StoC::GenericFloat* packet) {
         if (!packet || packet->type != GW::Packet::StoC::GenericValueID::knocked_down
-            || !IsMapReady() || !std::isfinite(packet->value) || packet->value <= 0.f
-            || !IsEnemyAgent(packet->agent_id)) {
+            || !IsMapReady() || !std::isfinite(packet->value) || packet->value <= 0.f) {
             return;
         }
         const auto duration_ms_value = static_cast<double>(packet->value) * 1000.0;
@@ -925,19 +926,40 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
         const auto generation = map_generation.load(std::memory_order_acquire);
         const auto now = GW::MemoryMgr::GetSkillTimer();
         const auto duration_ms = static_cast<uint32_t>(duration_ms_value);
-        std::lock_guard lock(tracking_mutex);
-        if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
-            return;
+        uint32_t interrupted_skill_id = 0;
+        {
+            std::lock_guard lock(tracking_mutex);
+            if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
+                return;
+            }
+            if (IsEnemyAgent(packet->agent_id)) {
+                const auto existing = std::ranges::find_if(tracked_knockdowns, [packet](const TrackedKnockdown& knockdown) {
+                    return knockdown.agent_id == packet->agent_id;
+                });
+                if (existing != tracked_knockdowns.end()) {
+                    existing->timestamp = now;
+                    existing->duration_ms = duration_ms;
+                }
+                else {
+                    tracked_knockdowns.push_back({packet->agent_id, now, duration_ms});
+                }
+            }
+            // A knockdown interrupts whatever skill the agent was casting, but (unlike a real interrupt) never
+            // sends the server's "interrupted" confirmation, so the confirmed-interrupt path below never fires
+            // for it. Start that skill's cooldown directly from our own in-progress-cast bookkeeping instead.
+            std::erase_if(in_progress_casts, [now](const InProgressCast& cast) {
+                return now - cast.timestamp > cast_in_progress_timeout_ms;
+            });
+            const auto casting = std::ranges::find_if(in_progress_casts, [packet](const InProgressCast& cast) {
+                return cast.agent_id == packet->agent_id;
+            });
+            if (casting != in_progress_casts.end()) {
+                interrupted_skill_id = casting->skill_id;
+                in_progress_casts.erase(casting);
+            }
         }
-        const auto existing = std::ranges::find_if(tracked_knockdowns, [packet](const TrackedKnockdown& knockdown) {
-            return knockdown.agent_id == packet->agent_id;
-        });
-        if (existing != tracked_knockdowns.end()) {
-            existing->timestamp = now;
-            existing->duration_ms = duration_ms;
-        }
-        else {
-            tracked_knockdowns.push_back({packet->agent_id, now, duration_ms});
+        if (interrupted_skill_id) {
+            TrackAgentCooldown(packet->agent_id, interrupted_skill_id, true);
         }
     });
     if (!knockdown_callback_registered) {
@@ -1007,6 +1029,10 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
                 confirmed = true;
                 confirmed_interrupts.erase(flag);
             }
+            // This agent is no longer casting anything, whether this was a real interrupt or a plain cancel.
+            std::erase_if(in_progress_casts, [agent_id = packet->agent_id](const InProgressCast& cast) {
+                return cast.agent_id == agent_id;
+            });
         }
         if (confirmed) {
             TrackAgentCooldown(packet->agent_id, static_cast<uint32_t>(packet->skill_id), true);
@@ -1014,8 +1040,7 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
     });
     GW::UI::RegisterUIMessageCallback(&skill_started_cast_hook, GW::UI::UIMessage::kAgentSkillStartedCast, [this](GW::HookStatus*, GW::UI::UIMessage, void* wparam, void*) {
         const auto* packet = static_cast<GW::UI::UIPacket::kAgentSkillStartedCast*>(wparam);
-        if (!packet || !IsMapReady()
-            || packet->agent_id != GW::Agents::GetControlledCharacterId()) {
+        if (!packet || !IsMapReady()) {
             return;
         }
         const auto generation = map_generation.load(std::memory_order_acquire);
@@ -1023,11 +1048,30 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
         if (skill_id >= GW::SkillbarMgr::GetSkillCount()) {
             return;
         }
+        const auto now = GW::MemoryMgr::GetSkillTimer();
+        {
+            std::lock_guard lock(tracking_mutex);
+            if (generation == map_generation.load(std::memory_order_acquire) && IsMapReady()
+                && FindCooldownConfig(static_cast<int>(skill_id))) {
+                // Any agent whose cooldown we might track: remember it's casting this skill, in case a
+                // knockdown cuts the cast short (see the knockdown_hook callback above).
+                const auto agent_id = packet->agent_id;
+                std::erase_if(in_progress_casts, [now](const InProgressCast& cast) {
+                    return now - cast.timestamp > cast_in_progress_timeout_ms;
+                });
+                std::erase_if(in_progress_casts, [agent_id](const InProgressCast& cast) {
+                    return cast.agent_id == agent_id;
+                });
+                in_progress_casts.push_back({agent_id, skill_id, now});
+            }
+        }
+        if (packet->agent_id != GW::Agents::GetControlledCharacterId()) {
+            return;
+        }
         const auto* skill = GW::SkillbarMgr::GetSkillConstantData(packet->skill_id);
         if (!IsTrackedCastType(skill)) {
             return;
         }
-        const auto now = GW::MemoryMgr::GetSkillTimer();
         std::lock_guard lock(tracking_mutex);
         if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
             return;
@@ -1045,6 +1089,12 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
         if (packet && IsMapReady()) {
             const auto generation = map_generation.load(std::memory_order_acquire);
             TrackAgentCooldown(packet->agent_id, static_cast<uint32_t>(packet->skill_id));
+            {
+                std::lock_guard lock(tracking_mutex);
+                std::erase_if(in_progress_casts, [agent_id = packet->agent_id](const InProgressCast& cast) {
+                    return cast.agent_id == agent_id;
+                });
+            }
             if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
                 return;
             }
@@ -1075,6 +1125,12 @@ void SlopAuras::Initialize(ImGuiContext* ctx, ImGuiAllocFns allocator_fns, HMODU
         if (packet && IsMapReady()) {
             const auto generation = map_generation.load(std::memory_order_acquire);
             TrackAgentCooldown(packet->agent_id, static_cast<uint32_t>(packet->skill_id));
+            {
+                std::lock_guard lock(tracking_mutex);
+                std::erase_if(in_progress_casts, [agent_id = packet->agent_id](const InProgressCast& cast) {
+                    return cast.agent_id == agent_id;
+                });
+            }
             if (generation != map_generation.load(std::memory_order_acquire) || !IsMapReady()) {
                 return;
             }
@@ -1107,6 +1163,7 @@ void SlopAuras::Terminate()
         tracked_cooldowns.clear();
         tracked_knockdowns.clear();
         pending_casts.clear();
+        in_progress_casts.clear();
         confirmed_interrupts.clear();
         agent_recharge_factors.clear();
         player_effect_notifications.clear();

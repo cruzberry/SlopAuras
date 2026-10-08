@@ -77,6 +77,15 @@ private:
         uint32_t timestamp;
     };
 
+    // Tracks "this agent is currently casting this skill", for any agent (not just the player). Used solely to
+    // start a cooldown when a cast is cut short by a knockdown, which (unlike a real interrupt) never sends the
+    // server's "interrupted" confirmation that the existing confirmed-interrupt path relies on.
+    struct InProgressCast {
+        uint32_t agent_id;
+        uint32_t skill_id;
+        uint32_t timestamp;
+    };
+
     // Which agents an effect is looked for on when it was not cast by the player (cast_by_me == false).
     // Ignored while cast_by_me is true: that path already resolves the real cast target for us.
     enum class EffectTarget {
@@ -190,6 +199,7 @@ private:
     std::vector<TrackedCooldown> tracked_cooldowns;
     std::vector<TrackedKnockdown> tracked_knockdowns;
     std::vector<PendingCast> pending_casts;
+    std::vector<InProgressCast> in_progress_casts;
     std::vector<PlayerEffectNotification> player_effect_notifications;
     std::vector<std::pair<int, bool>> player_effect_config_snapshot;
     std::vector<InterruptFlag> confirmed_interrupts;
