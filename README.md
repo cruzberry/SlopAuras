@@ -2,8 +2,9 @@
 
 SlopAuras is a GWToolbox++ plugin that tracks selected effects and cooldowns. Features include:
 
-* Enemy nameplates
-* Track skills/effects
+* Nameplates for enemies and allies (knockdown timers, tracked effects, tracked cooldowns)
+* Track skills/effects on yourself, allies, or enemies, regardless of who cast them
+* Track skill cooldowns on enemies and allies (including knockdown interrupts)
 * Chat commands
 * Sound alerts
 
