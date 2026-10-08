@@ -98,9 +98,17 @@ private:
         EffectTarget target = EffectTarget::Me;
     };
 
+    // Which agents a cooldown is tracked on.
+    enum class CooldownTarget {
+        Enemy,
+        Ally
+    };
+
     struct CooldownConfig {
         int skill_id = 0;
         std::string ready_sound;
+        // Default preserves pre-existing behavior: cooldowns were only ever tracked on enemies.
+        CooldownTarget target = CooldownTarget::Enemy;
     };
 
     struct ActiveEffect {
@@ -137,7 +145,9 @@ private:
     // caster_agent_id == 0 means "the player"; non-zero is used for the "effect on enemies, cast by any ally"
     // path, which reuses this same prediction/merge logic for an arbitrary caster.
     void TrackCast(int skill_id, uint32_t target_agent_id, uint32_t caster_agent_id = 0);
-    void TrackEnemyCooldown(uint32_t agent_id, uint32_t skill_id, bool from_interrupt = false);
+    // Tracks a cooldown for any agent (enemy or party ally); which skills are tracked for which target
+    // category is decided by cooldown_configs. Called unconditionally for every observed skill activation.
+    void TrackAgentCooldown(uint32_t agent_id, uint32_t skill_id, bool from_interrupt = false);
     // Single source of truth for "what is active right now", shared by the widget and the chat command.
     std::vector<ActiveEffect> CollectActiveEffects(uint32_t now, bool validate_casts);
     // The helpers below read the tracked-skill config; callers must hold tracking_mutex.
@@ -147,6 +157,9 @@ private:
     // True if some config wants this skill tracked on enemies regardless of who casts it.
     bool IsTrackedExternalEnemyTarget(int skill_id) const;
     const CooldownConfig* FindCooldownConfig(int skill_id) const;
+    // Overload used when creating a new tracked cooldown, so an Enemy-only or Ally-only config entry
+    // doesn't get matched against the wrong target category.
+    const CooldownConfig* FindCooldownConfig(int skill_id, CooldownTarget target) const;
     float GetAgentRechargeFactor(uint32_t agent_id, uint32_t now) const;
     void RecordAgentRechargeFactor(uint32_t agent_id, float factor, uint32_t now);
     void PrintTrackedEffects();
@@ -198,6 +211,8 @@ private:
     bool pending_welcome_message = false;
     bool widget_mode = false;
     bool enemy_nameplates_enabled = true;
+    // Default ON: showing tracked effects/cooldowns on party nameplates is opt-out, not opt-in.
+    bool ally_nameplates_enabled = true;
     bool nameplate_show_knockdown = true;
     bool nameplate_show_effects = true;
     bool nameplate_show_cooldowns = true;
