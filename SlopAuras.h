@@ -77,17 +77,47 @@ private:
         uint32_t timestamp;
     };
 
+    // Tracks "this agent is currently casting this skill", for any agent (not just the player). Used solely to
+    // start a cooldown when a cast is cut short by a knockdown, which (unlike a real interrupt) never sends the
+    // server's "interrupted" confirmation that the existing confirmed-interrupt path relies on.
+    struct InProgressCast {
+        uint32_t agent_id;
+        uint32_t skill_id;
+        uint32_t timestamp;
+    };
+
+    // Which agents an effect is looked for on when it was not cast by the player (cast_by_me == false).
+    // Ignored while cast_by_me is true: that path already resolves the real cast target for us.
+    enum class EffectTarget {
+        Me,
+        Allies,
+        Enemies
+    };
+
     struct EffectConfig {
         int skill_id = 0;
         bool cast_by_me = false;
         // Empty sounds fall back to the group-level sound in notification_sound_paths.
         std::string applied_sound;
         std::string expiring_sound;
+        // Defaults preserve the only behavior that existed before these toggles: shown everywhere.
+        bool show_in_window = true;
+        bool show_on_nameplate = true;
+        // Default preserves pre-existing behavior: effects not cast by the player were only ever looked for on the player.
+        EffectTarget target = EffectTarget::Me;
+    };
+
+    // Which agents a cooldown is tracked on.
+    enum class CooldownTarget {
+        Enemy,
+        Ally
     };
 
     struct CooldownConfig {
         int skill_id = 0;
         std::string ready_sound;
+        // Default preserves pre-existing behavior: cooldowns were only ever tracked on enemies.
+        CooldownTarget target = CooldownTarget::Enemy;
     };
 
     struct ActiveEffect {
@@ -121,15 +151,24 @@ private:
         std::wstring path;
     };
 
-    void TrackCast(int skill_id, uint32_t target_agent_id);
-    void TrackEnemyCooldown(uint32_t agent_id, uint32_t skill_id, bool from_interrupt = false);
+    // caster_agent_id == 0 means "the player"; non-zero is used for the "effect on enemies, cast by any ally"
+    // path, which reuses this same prediction/merge logic for an arbitrary caster.
+    void TrackCast(int skill_id, uint32_t target_agent_id, uint32_t caster_agent_id = 0);
+    // Tracks a cooldown for any agent (enemy or party ally); which skills are tracked for which target
+    // category is decided by cooldown_configs. Called unconditionally for every observed skill activation.
+    void TrackAgentCooldown(uint32_t agent_id, uint32_t skill_id, bool from_interrupt = false);
     // Single source of truth for "what is active right now", shared by the widget and the chat command.
     std::vector<ActiveEffect> CollectActiveEffects(uint32_t now, bool validate_casts);
     // The helpers below read the tracked-skill config; callers must hold tracking_mutex.
     const EffectConfig* FindEffectConfig(int skill_id) const;
     bool IsTrackedEffect(int skill_id) const { return FindEffectConfig(skill_id) != nullptr; }
     bool IsCastByMe(int skill_id) const;
+    // True if some config wants this skill tracked on enemies regardless of who casts it.
+    bool IsTrackedExternalEnemyTarget(int skill_id) const;
     const CooldownConfig* FindCooldownConfig(int skill_id) const;
+    // Overload used when creating a new tracked cooldown, so an Enemy-only or Ally-only config entry
+    // doesn't get matched against the wrong target category.
+    const CooldownConfig* FindCooldownConfig(int skill_id, CooldownTarget target) const;
     float GetAgentRechargeFactor(uint32_t agent_id, uint32_t now) const;
     void RecordAgentRechargeFactor(uint32_t agent_id, float factor, uint32_t now);
     void PrintTrackedEffects();
@@ -149,6 +188,7 @@ private:
     GW::HookEntry map_loading_hook;
     GW::HookEntry knockdown_hook;
     GW::HookEntry generic_value_hook;
+    GW::HookEntry generic_value_target_hook;
     std::atomic<uint32_t> map_generation = 0;
     std::atomic<uint32_t> ready_map_generation = 0;
     std::mutex tracking_mutex;
@@ -159,6 +199,7 @@ private:
     std::vector<TrackedCooldown> tracked_cooldowns;
     std::vector<TrackedKnockdown> tracked_knockdowns;
     std::vector<PendingCast> pending_casts;
+    std::vector<InProgressCast> in_progress_casts;
     std::vector<PlayerEffectNotification> player_effect_notifications;
     std::vector<std::pair<int, bool>> player_effect_config_snapshot;
     std::vector<InterruptFlag> confirmed_interrupts;
@@ -180,6 +221,8 @@ private:
     bool pending_welcome_message = false;
     bool widget_mode = false;
     bool enemy_nameplates_enabled = true;
+    // Default ON: showing tracked effects/cooldowns on party nameplates is opt-out, not opt-in.
+    bool ally_nameplates_enabled = true;
     bool nameplate_show_knockdown = true;
     bool nameplate_show_effects = true;
     bool nameplate_show_cooldowns = true;
