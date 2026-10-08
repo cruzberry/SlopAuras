@@ -77,6 +77,14 @@ private:
         uint32_t timestamp;
     };
 
+    // Which agents an effect is looked for on when it was not cast by the player (cast_by_me == false).
+    // Ignored while cast_by_me is true: that path already resolves the real cast target for us.
+    enum class EffectTarget {
+        Me,
+        Allies,
+        Enemies
+    };
+
     struct EffectConfig {
         int skill_id = 0;
         bool cast_by_me = false;
@@ -86,6 +94,8 @@ private:
         // Defaults preserve the only behavior that existed before these toggles: shown everywhere.
         bool show_in_window = true;
         bool show_on_nameplate = true;
+        // Default preserves pre-existing behavior: effects not cast by the player were only ever looked for on the player.
+        EffectTarget target = EffectTarget::Me;
     };
 
     struct CooldownConfig {
@@ -124,7 +134,9 @@ private:
         std::wstring path;
     };
 
-    void TrackCast(int skill_id, uint32_t target_agent_id);
+    // caster_agent_id == 0 means "the player"; non-zero is used for the "effect on enemies, cast by any ally"
+    // path, which reuses this same prediction/merge logic for an arbitrary caster.
+    void TrackCast(int skill_id, uint32_t target_agent_id, uint32_t caster_agent_id = 0);
     void TrackEnemyCooldown(uint32_t agent_id, uint32_t skill_id, bool from_interrupt = false);
     // Single source of truth for "what is active right now", shared by the widget and the chat command.
     std::vector<ActiveEffect> CollectActiveEffects(uint32_t now, bool validate_casts);
@@ -132,6 +144,8 @@ private:
     const EffectConfig* FindEffectConfig(int skill_id) const;
     bool IsTrackedEffect(int skill_id) const { return FindEffectConfig(skill_id) != nullptr; }
     bool IsCastByMe(int skill_id) const;
+    // True if some config wants this skill tracked on enemies regardless of who casts it.
+    bool IsTrackedExternalEnemyTarget(int skill_id) const;
     const CooldownConfig* FindCooldownConfig(int skill_id) const;
     float GetAgentRechargeFactor(uint32_t agent_id, uint32_t now) const;
     void RecordAgentRechargeFactor(uint32_t agent_id, float factor, uint32_t now);
@@ -152,6 +166,7 @@ private:
     GW::HookEntry map_loading_hook;
     GW::HookEntry knockdown_hook;
     GW::HookEntry generic_value_hook;
+    GW::HookEntry generic_value_target_hook;
     std::atomic<uint32_t> map_generation = 0;
     std::atomic<uint32_t> ready_map_generation = 0;
     std::mutex tracking_mutex;
