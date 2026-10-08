@@ -105,6 +105,23 @@ namespace {
         }
     }
 
+    // A tracked skill whose sole effect is to inflict a condition (e.g. Weaken Armor -> Cracked Armor) is
+    // displayed using the condition's own icon/name, since the condition is what actually matters to the
+    // player and is shared by every skill that can cause it. Hexes keep their own icon even if they also
+    // carry a condition.
+    int GetDisplaySkillId(const int skill_id)
+    {
+        if (skill_id <= 0 || static_cast<uint32_t>(skill_id) >= GW::SkillbarMgr::GetSkillCount()) {
+            return skill_id;
+        }
+        const auto* skill = GW::SkillbarMgr::GetSkillConstantData(static_cast<GW::Constants::SkillID>(skill_id));
+        if (!skill || skill->type == GW::Constants::SkillType::Hex || skill->condition == 0) {
+            return skill_id;
+        }
+        const auto condition_skill_id = GetConditionIconSkill(skill->condition);
+        return condition_skill_id != GW::Constants::SkillID::No_Skill ? static_cast<int>(condition_skill_id) : skill_id;
+    }
+
     struct AgentProjection {
         DirectX::XMMATRIX view_projection;
         uint32_t viewport_width;
@@ -688,6 +705,9 @@ std::vector<SlopAuras::ActiveEffect> SlopAuras::CollectActiveEffects(const uint3
         if (skill_id <= 0) {
             continue;
         }
+        // Conditions are displayed as themselves, not as the (possibly several different) skills that can
+        // cause them.
+        const auto display_skill_id = GetDisplaySkillId(skill_id);
 
         // Effects on the player that were not cast by the player come straight from the game's effect list.
         if (player_effects && !config.cast_by_me) {
@@ -698,7 +718,7 @@ std::vector<SlopAuras::ActiveEffect> SlopAuras::CollectActiveEffects(const uint3
                 }
             }
             if (remaining > 0) {
-                add_active_effect(skill_id, GW::Agents::GetControlledCharacterId(), remaining);
+                add_active_effect(display_skill_id, GW::Agents::GetControlledCharacterId(), remaining);
             }
         }
 
@@ -719,7 +739,7 @@ std::vector<SlopAuras::ActiveEffect> SlopAuras::CollectActiveEffects(const uint3
                     continue;
                 }
             }
-            add_active_effect(skill_id, cast.multi_ally ? 0 : cast.target_agent_id, remaining);
+            add_active_effect(display_skill_id, cast.multi_ally ? 0 : cast.target_agent_id, remaining);
         }
     }
     return active_effects;
@@ -1305,19 +1325,10 @@ void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
                 if (!skill) {
                     continue;
                 }
-                auto icon_skill_id = GW::Constants::SkillID::No_Skill;
-                if (skill->type == GW::Constants::SkillType::Hex) {
-                    icon_skill_id = static_cast<GW::Constants::SkillID>(cast.skill_id);
-                }
-                else if (skill->condition != 0) {
-                    icon_skill_id = GetConditionIconSkill(skill->condition);
-                    if (icon_skill_id == GW::Constants::SkillID::No_Skill) {
-                        icon_skill_id = static_cast<GW::Constants::SkillID>(cast.skill_id);
-                    }
-                }
+                const auto display_skill_id = GetDisplaySkillId(static_cast<int>(cast.skill_id));
                 IDirect3DTexture9* icon_texture = nullptr;
-                if (icon_skill_id != GW::Constants::SkillID::No_Skill) {
-                    const auto icon = GetSkillImage(icon_skill_id);
+                if (display_skill_id > 0) {
+                    const auto icon = GetSkillImage(static_cast<GW::Constants::SkillID>(display_skill_id));
                     icon_texture = icon && *icon ? *icon : nullptr;
                 }
                 const auto remaining = std::format("{:.1f}s",
@@ -1326,7 +1337,7 @@ void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
                     lines.push_back({remaining, IM_COL32(190, 225, 255, 255), icon_texture});
                 }
                 else {
-                    lines.push_back({std::format("{}  {}", GetSkillName(static_cast<int>(cast.skill_id)), remaining),
+                    lines.push_back({std::format("{}  {}", GetSkillName(display_skill_id), remaining),
                         IM_COL32(190, 225, 255, 255)});
                 }
             }
