@@ -702,7 +702,7 @@ std::vector<SlopAuras::ActiveEffect> SlopAuras::CollectActiveEffects(const uint3
             return {};
         }
         const auto skill_id = config.skill_id;
-        if (skill_id <= 0) {
+        if (skill_id <= 0 || !config.show_in_window) {
             continue;
         }
         // Conditions are displayed as themselves, not as the (possibly several different) skills that can
@@ -1263,7 +1263,9 @@ void SlopAuras::DrawEnemyNameplates(IDirect3DDevice9* device)
     {
         std::lock_guard lock(tracking_mutex);
         for (const auto& config : effect_configs) {
-            tracked_effect_ids.insert(config.skill_id);
+            if (config.show_on_nameplate) {
+                tracked_effect_ids.insert(config.skill_id);
+            }
         }
         for (const auto& config : cooldown_configs) {
             tracked_cooldown_ids.insert(config.skill_id);
@@ -1840,11 +1842,13 @@ void SlopAuras::DrawSettingsWindow()
         return changed;
     };
 
-    if (ImGui::BeginTable("effect_ids_table", 6,
+    if (ImGui::BeginTable("effect_ids_table", 8,
         ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-        ImGui::TableSetupColumn("Skill", ImGuiTableColumnFlags_WidthStretch, 0.28f);
+        ImGui::TableSetupColumn("Skill", ImGuiTableColumnFlags_WidthStretch, 0.24f);
         ImGui::TableSetupColumn("Skill ID", ImGuiTableColumnFlags_WidthFixed, 90.f);
         ImGui::TableSetupColumn("Cast by me", ImGuiTableColumnFlags_WidthFixed, 90.f);
+        ImGui::TableSetupColumn("In window", ImGuiTableColumnFlags_WidthFixed, 70.f);
+        ImGui::TableSetupColumn("On nameplate", ImGuiTableColumnFlags_WidthFixed, 90.f);
         ImGui::TableSetupColumn("Applied sound", ImGuiTableColumnFlags_WidthStretch, 0.18f);
         ImGui::TableSetupColumn("Expiring sound", ImGuiTableColumnFlags_WidthStretch, 0.18f);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70.f);
@@ -1875,6 +1879,12 @@ void SlopAuras::DrawSettingsWindow()
             if (IsTrackedCastType(skill)) {
                 settings_changed |= ImGui::Checkbox("##cast_by_me", &config.cast_by_me);
             }
+
+            ImGui::TableNextColumn();
+            settings_changed |= ImGui::Checkbox("##show_in_window", &config.show_in_window);
+
+            ImGui::TableNextColumn();
+            settings_changed |= ImGui::Checkbox("##show_on_nameplate", &config.show_on_nameplate);
 
             ImGui::TableNextColumn();
             settings_changed |= draw_wav_override_button("applied_wav", config.applied_sound,
@@ -2029,6 +2039,11 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         std::vector<std::string> saved_applied_sounds;
         std::vector<std::string> saved_expiring_sounds;
         std::vector<std::string> saved_cooldown_sounds;
+        // Indices listed here have the corresponding true-by-default flag turned off. An empty/missing list
+        // (as in any settings file saved before these toggles existed) means every entry keeps showing
+        // everywhere, exactly as before.
+        std::vector<int> saved_hide_in_window_entries;
+        std::vector<int> saved_hide_on_nameplate_entries;
         LoadSetting("effect_ids", saved_effect_ids);
         LoadSetting("cast_by_me_entries", saved_cast_by_me_entries);
         LoadSetting("cooldown_ids", saved_cooldown_ids);
@@ -2036,6 +2051,8 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
         LoadSetting("effect_applied_sound_overrides", saved_applied_sounds);
         LoadSetting("effect_expiring_sound_overrides", saved_expiring_sounds);
         LoadSetting("cooldown_sound_overrides", saved_cooldown_sounds);
+        LoadSetting("effect_hide_in_window_entries", saved_hide_in_window_entries);
+        LoadSetting("effect_hide_on_nameplate_entries", saved_hide_on_nameplate_entries);
         effect_configs.clear();
         for (size_t i = 0; i < saved_effect_ids.size(); ++i) {
             EffectConfig config;
@@ -2043,6 +2060,8 @@ void SlopAuras::LoadSettings(const wchar_t* folder)
             config.cast_by_me = std::ranges::find(saved_cast_by_me_entries, static_cast<int>(i)) != saved_cast_by_me_entries.end();
             config.applied_sound = i < saved_applied_sounds.size() ? saved_applied_sounds[i] : std::string{};
             config.expiring_sound = i < saved_expiring_sounds.size() ? saved_expiring_sounds[i] : std::string{};
+            config.show_in_window = std::ranges::find(saved_hide_in_window_entries, static_cast<int>(i)) == saved_hide_in_window_entries.end();
+            config.show_on_nameplate = std::ranges::find(saved_hide_on_nameplate_entries, static_cast<int>(i)) == saved_hide_on_nameplate_entries.end();
             effect_configs.push_back(std::move(config));
         }
         cooldown_configs.clear();
@@ -2090,6 +2109,8 @@ void SlopAuras::SaveSettings(const wchar_t* folder)
         std::vector<std::string> effect_applied_sound_overrides;
         std::vector<std::string> effect_expiring_sound_overrides;
         std::vector<std::string> cooldown_sound_overrides;
+        std::vector<int> effect_hide_in_window_entries;
+        std::vector<int> effect_hide_on_nameplate_entries;
         for (size_t i = 0; i < effect_configs.size(); ++i) {
             effect_ids.push_back(effect_configs[i].skill_id);
             if (effect_configs[i].cast_by_me) {
@@ -2097,6 +2118,12 @@ void SlopAuras::SaveSettings(const wchar_t* folder)
             }
             effect_applied_sound_overrides.push_back(effect_configs[i].applied_sound);
             effect_expiring_sound_overrides.push_back(effect_configs[i].expiring_sound);
+            if (!effect_configs[i].show_in_window) {
+                effect_hide_in_window_entries.push_back(static_cast<int>(i));
+            }
+            if (!effect_configs[i].show_on_nameplate) {
+                effect_hide_on_nameplate_entries.push_back(static_cast<int>(i));
+            }
         }
         for (const auto& config : cooldown_configs) {
             cooldown_ids.push_back(config.skill_id);
@@ -2109,6 +2136,8 @@ void SlopAuras::SaveSettings(const wchar_t* folder)
         SaveSetting("effect_applied_sound_overrides", effect_applied_sound_overrides);
         SaveSetting("effect_expiring_sound_overrides", effect_expiring_sound_overrides);
         SaveSetting("cooldown_sound_overrides", cooldown_sound_overrides);
+        SaveSetting("effect_hide_in_window_entries", effect_hide_in_window_entries);
+        SaveSetting("effect_hide_on_nameplate_entries", effect_hide_on_nameplate_entries);
         SaveSetting("adaptive_recharge_enabled", adaptive_recharge_enabled);
         SaveSetting("widget_mode", widget_mode);
         SaveSetting("effect_icon_size", effect_icon_size);

@@ -83,6 +83,9 @@ private:
         // Empty sounds fall back to the group-level sound in notification_sound_paths.
         std::string applied_sound;
         std::string expiring_sound;
+        // Defaults preserve the only behavior that existed before these toggles: shown everywhere.
+        bool show_in_window = true;
+        bool show_on_nameplate = true;
     };
 
     struct CooldownConfig {
