@@ -460,7 +460,7 @@ namespace {
         const std::wstring wide_path(path.data());
         if (wide_path.size() >= 256) {
             GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2,
-                L"SlopAuras: notification WAV path must be shorter than 256 characters.", L"SlopAuras");
+                L"notification WAV path must be shorter than 256 characters.", L"SlopAuras");
             return false;
         }
         selected_path = PluginUtils::WStringToString(wide_path);
@@ -500,7 +500,7 @@ void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const 
     if (argc < 2 || !argv || !argv[1]) {
         auto* visible = instance->GetVisiblePtr();
         *visible = true;
-        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"SlopAuras: Window shown.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"Window shown.", L"SlopAuras");
         return;
     }
 
@@ -508,13 +508,13 @@ void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const 
     if (subcommand == L"hide" || subcommand == L"show") {
         auto* visible = instance->GetVisiblePtr();
         *visible = !*visible;
-        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, *visible ? L"SlopAuras: Window shown." : L"SlopAuras: Window hidden.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, *visible ? L"Window shown." : L"Window hidden.", L"SlopAuras");
     }
     else if (subcommand == L"settings" || subcommand == L"s") {
         instance->settings_window_visible = !instance->settings_window_visible;
         GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, instance->settings_window_visible
-            ? L"SlopAuras: Settings window shown."
-            : L"SlopAuras: Settings window hidden.", L"SlopAuras");
+            ? L"Settings window shown."
+            : L"Settings window hidden.", L"SlopAuras");
     }
     else if (subcommand == L"print") {
         instance->PrintTrackedEffects();
@@ -523,8 +523,8 @@ void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const 
         const auto muted = !instance->notifications_muted.load(std::memory_order_acquire);
         instance->SetNotificationsMuted(muted);
         GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, muted
-            ? L"SlopAuras: Sound notifications muted."
-            : L"SlopAuras: Sound notifications unmuted.", L"SlopAuras");
+            ? L"Sound notifications muted."
+            : L"Sound notifications unmuted.", L"SlopAuras");
     }
     else {
         print_help();
@@ -818,7 +818,7 @@ std::vector<SlopAuras::ActiveEffect> SlopAuras::CollectActiveEffects(const uint3
 void SlopAuras::PrintTrackedEffects()
 {
     if (!IsMapReady()) {
-        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"SlopAuras: Map is not ready.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"Map is not ready.", L"SlopAuras");
         return;
     }
 
@@ -884,7 +884,7 @@ void SlopAuras::PrintTrackedEffects()
         return;
     }
     if (messages.empty()) {
-        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"SlopAuras: No tracked effects or cooldowns active.", L"SlopAuras");
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"No tracked effects or cooldowns active.", L"SlopAuras");
         return;
     }
     for (const auto& message : messages) {
