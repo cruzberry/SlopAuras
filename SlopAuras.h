@@ -34,25 +34,12 @@ public:
 
 private:
     enum class NotificationType : size_t {
+        // EffectApplied and EffectExpiring belonged to effect tracking, which is being reworked and currently
+        // produces no notifications. They stay in the enum so the saved notification arrays keep their layout.
         EffectApplied,
         EffectExpiring,
         CooldownReady,
         Count
-    };
-
-    struct TrackedCast {
-        uint32_t skill_id;
-        uint32_t target_agent_id;
-        uint32_t timestamp;
-        uint32_t duration_ms;
-        bool expiration_notified = false;
-        bool multi_ally = false;
-        uint32_t observed_remaining_ms = 0;
-        uint32_t observed_updated_timestamp = 0;
-        // Hex/condition on a foe: Natural Resistance is resolved lazily (the target name decodes asynchronously).
-        bool resistance_pending = false;
-        // duration_ms was taken from the game's own effect data instead of being predicted.
-        bool duration_exact = false;
     };
 
     struct TrackedCooldown {
@@ -71,12 +58,6 @@ private:
         uint32_t duration_ms;
     };
 
-    struct PendingCast {
-        uint32_t skill_id;
-        uint32_t target_agent_id;
-        uint32_t timestamp;
-    };
-
     // Tracks "this agent is currently casting this skill", for any agent (not just the player). Used solely to
     // start a cooldown when a cast is cut short by a knockdown, which (unlike a real interrupt) never sends the
     // server's "interrupted" confirmation that the existing confirmed-interrupt path relies on.
@@ -84,27 +65,6 @@ private:
         uint32_t agent_id;
         uint32_t skill_id;
         uint32_t timestamp;
-    };
-
-    // Which agents an effect is looked for on when it was not cast by the player (cast_by_me == false).
-    // Ignored while cast_by_me is true: that path already resolves the real cast target for us.
-    enum class EffectTarget {
-        Me,
-        Allies,
-        Enemies
-    };
-
-    struct EffectConfig {
-        int skill_id = 0;
-        bool cast_by_me = false;
-        // Empty sounds fall back to the group-level sound in notification_sound_paths.
-        std::string applied_sound;
-        std::string expiring_sound;
-        // Defaults preserve the only behavior that existed before these toggles: shown everywhere.
-        bool show_in_window = true;
-        bool show_on_nameplate = true;
-        // Default preserves pre-existing behavior: effects not cast by the player were only ever looked for on the player.
-        EffectTarget target = EffectTarget::Me;
     };
 
     // Which agents a cooldown is tracked on.
@@ -120,12 +80,6 @@ private:
         CooldownTarget target = CooldownTarget::Enemy;
     };
 
-    struct ActiveEffect {
-        int skill_id;
-        uint32_t target_agent_id; // 0 = every ally
-        DWORD remaining;
-    };
-
     // Set from the raw StoC "interrupted" packet; consumed by the kAgentSkillInterrupted UI message.
     struct InterruptFlag {
         uint32_t agent_id;
@@ -139,39 +93,22 @@ private:
         uint32_t observed_at;
     };
 
-    struct PlayerEffectNotification {
-        uint32_t skill_id;
-        uint32_t timestamp;
-        bool expiration_notified = false;
-    };
-
     struct QueuedNotification {
         NotificationType type;
         uint32_t skill_id;
         std::wstring path;
     };
 
-    // caster_agent_id == 0 means "the player"; non-zero is used for the "effect on enemies, cast by any ally"
-    // path, which reuses this same prediction/merge logic for an arbitrary caster.
-    void TrackCast(int skill_id, uint32_t target_agent_id, uint32_t caster_agent_id = 0);
     // Tracks a cooldown for any agent (enemy or party ally); which skills are tracked for which target
     // category is decided by cooldown_configs. Called unconditionally for every observed skill activation.
     void TrackAgentCooldown(uint32_t agent_id, uint32_t skill_id, bool from_interrupt = false);
-    // Single source of truth for "what is active right now", shared by the widget and the chat command.
-    std::vector<ActiveEffect> CollectActiveEffects(uint32_t now, bool validate_casts);
-    // The helpers below read the tracked-skill config; callers must hold tracking_mutex.
-    const EffectConfig* FindEffectConfig(int skill_id) const;
-    bool IsTrackedEffect(int skill_id) const { return FindEffectConfig(skill_id) != nullptr; }
-    bool IsCastByMe(int skill_id) const;
-    // True if some config wants this skill tracked on enemies regardless of who casts it.
-    bool IsTrackedExternalEnemyTarget(int skill_id) const;
     const CooldownConfig* FindCooldownConfig(int skill_id) const;
     // Overload used when creating a new tracked cooldown, so an Enemy-only or Ally-only config entry
     // doesn't get matched against the wrong target category.
     const CooldownConfig* FindCooldownConfig(int skill_id, CooldownTarget target) const;
     float GetAgentRechargeFactor(uint32_t agent_id, uint32_t now) const;
     void RecordAgentRechargeFactor(uint32_t agent_id, float factor, uint32_t now);
-    void PrintTrackedEffects();
+    void PrintTrackedCooldowns();
     void PlayNotification(NotificationType type, uint32_t skill_id = 0);
     std::string ResolveNotificationSoundPath(NotificationType type, uint32_t skill_id) const;
     void NotificationWorker();
@@ -188,23 +125,18 @@ private:
     GW::HookEntry map_loading_hook;
     GW::HookEntry knockdown_hook;
     GW::HookEntry generic_value_hook;
-    GW::HookEntry generic_value_target_hook;
     std::atomic<uint32_t> map_generation = 0;
     std::atomic<uint32_t> ready_map_generation = 0;
     std::mutex tracking_mutex;
-    std::vector<EffectConfig> effect_configs;
     std::vector<CooldownConfig> cooldown_configs;
-    std::vector<std::string> natural_resistance_agent_names;
-    std::vector<TrackedCast> tracked_casts;
     std::vector<TrackedCooldown> tracked_cooldowns;
     std::vector<TrackedKnockdown> tracked_knockdowns;
-    std::vector<PendingCast> pending_casts;
     std::vector<InProgressCast> in_progress_casts;
-    std::vector<PlayerEffectNotification> player_effect_notifications;
-    std::vector<std::pair<int, bool>> player_effect_config_snapshot;
     std::vector<InterruptFlag> confirmed_interrupts;
     std::vector<AgentRechargeFactor> agent_recharge_factors;
-    bool player_effect_snapshot_initialized = false;
+    // Effect IDs entered in settings. Stored so they survive the rework; tracking of them is not implemented yet
+    // and every entry is reported as unavailable.
+    std::vector<int> effect_ids;
     std::array<bool, static_cast<size_t>(NotificationType::Count)> notification_enabled{};
     std::array<std::string, static_cast<size_t>(NotificationType::Count)> notification_sound_paths;
     std::atomic<bool> notifications_muted = false;
@@ -216,17 +148,14 @@ private:
     bool notification_playing = false;
     NotificationType notification_playing_type = NotificationType::EffectApplied;
     uint32_t notification_playing_skill_id = 0;
-    float notification_lead_seconds = 3.f;
     bool settings_window_visible = false;
     bool pending_welcome_message = false;
     bool widget_mode = false;
     bool enemy_nameplates_enabled = true;
-    // Default ON: showing tracked effects/cooldowns on party nameplates is opt-out, not opt-in.
+    // Default ON: showing tracked cooldowns on party nameplates is opt-out, not opt-in.
     bool ally_nameplates_enabled = true;
     bool nameplate_show_knockdown = true;
-    bool nameplate_show_effects = true;
     bool nameplate_show_cooldowns = true;
     bool adaptive_recharge_enabled = true;
-    float effect_icon_size = 22.f;
     float cooldown_icon_size = 22.f;
 };
