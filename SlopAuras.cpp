@@ -1,4 +1,5 @@
 #include "SlopAuras.h"
+#include "SlopAuras_skill_categories.h"
 
 #include <PluginUtils.h>
 
