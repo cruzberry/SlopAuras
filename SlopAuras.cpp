@@ -56,8 +56,7 @@ namespace {
         return living && living->allegiance == GW::Constants::Allegiance::Enemy;
     }
 
-    // Effect tracking is being reworked. Until the classification CSV is wired in, no skill is available and
-    // every entry is reported as unavailable in settings.
+    // Until classification CSV is wired in, every entry is reported as unavailable.
     bool IsEffectTrackingAvailable(const int skill_id)
     {
         (void)skill_id;
@@ -130,10 +129,10 @@ namespace {
         return std::isfinite(screen_position.x) && std::isfinite(screen_position.y);
     }
 
-    constexpr uint32_t recharge_factor_ttl_ms = 30000; // speed-up effects are short-lived; forget what we learned after this
+    constexpr uint32_t recharge_factor_ttl_ms = 30000; // speed-up effects are short-lived; forget recharge_factor after this
     constexpr float min_recharge_factor = 0.5f;        // recharge reductions do not stack beyond -50%
     constexpr uint32_t interrupt_match_window_ms = 1500;
-    constexpr uint32_t cast_in_progress_timeout_ms = 10000; // generous upper bound on any skill's cast time
+    constexpr uint32_t cast_in_progress_timeout_ms = 10000; // Slopmachines assumption of an upper bound on cast time. Fine.
 
     struct SkillName {
         std::mutex mutex;
@@ -327,8 +326,14 @@ void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const 
             ? L"Sound notifications muted."
             : L"Sound notifications unmuted.", L"SlopAuras");
     }
-    else {
+    else if (subcommand == L"bing") {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"Wǒ fēicháng xǐhuān BING CHILLING", L"SlopAuras");
+    }
+    else if (subcommand == L"help") {
         print_help();
+    }
+    else {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"Invalid command. Type /sa help for a list of commands.", L"SlopAuras");
     }
 }
 
