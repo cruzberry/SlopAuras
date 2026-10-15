@@ -327,8 +327,14 @@ void SlopAuras::HandleChatCommand(GW::HookStatus* status, const wchar_t*, const 
             ? L"Sound notifications muted."
             : L"Sound notifications unmuted.", L"SlopAuras");
     }
-    else {
+    else if (subcommand == L"bing") {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"Wǒ fēicháng xǐhuān BING CHILLING", L"SlopAuras");
+    }
+    else if (subcommand == L"help") {
         print_help();
+    }
+    else {
+        GW::Chat::WriteChat(GW::Chat::CHANNEL_GWCA2, L"Invalid command. Type /sa help for a list of commands.", L"SlopAuras");
     }
 }
 
